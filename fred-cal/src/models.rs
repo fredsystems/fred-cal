@@ -101,6 +101,7 @@ pub struct CalendarData {
 
 impl CalendarData {
     /// Create new empty calendar data
+    #[must_use]
     pub fn new() -> Self {
         Self {
             events: Vec::new(),
@@ -110,6 +111,7 @@ impl CalendarData {
     }
 
     /// Get events for a specific date range
+    #[must_use]
     pub fn events_in_range(&self, start: DateTime<Utc>, end: DateTime<Utc>) -> Vec<&CalendarEvent> {
         self.events
             .iter()
@@ -123,6 +125,7 @@ impl CalendarData {
     }
 
     /// Get todos due in a specific date range
+    #[must_use]
     #[allow(clippy::option_if_let_else)]
     pub fn todos_in_range(&self, start: DateTime<Utc>, end: DateTime<Utc>) -> Vec<&Todo> {
         self.todos
@@ -141,6 +144,7 @@ impl CalendarData {
     }
 
     /// Get all incomplete todos
+    #[must_use]
     #[allow(dead_code)]
     pub fn incomplete_todos(&self) -> Vec<&Todo> {
         self.todos

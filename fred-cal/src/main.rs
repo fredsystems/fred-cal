@@ -3,34 +3,17 @@
 // license that can be found in the LICENSE file or at
 // https://opensource.org/licenses/MIT.
 
-#![deny(
-    clippy::pedantic,
-    //clippy::cargo,
-    clippy::nursery,
-    clippy::style,
-    clippy::correctness,
-    clippy::all,
-    clippy::unwrap_used,
-    clippy::expect_used
-)]
+use anyhow::Result;
+use fast_dav_rs::CalDavClient;
+use fred_cal::api::create_router;
+use fred_cal::cache::CacheManager;
+use fred_cal::cli::Cli;
+use fred_cal::sync::SyncManager;
+use std::sync::Arc;
+use tracing_subscriber::{EnvFilter, fmt};
 
 #[macro_use]
 extern crate tracing;
-
-mod api;
-mod cache;
-mod cli;
-mod models;
-mod sync;
-
-use anyhow::Result;
-use api::create_router;
-use cache::CacheManager;
-use cli::Cli;
-use fast_dav_rs::CalDavClient;
-use std::sync::Arc;
-use sync::SyncManager;
-use tracing_subscriber::{EnvFilter, fmt};
 
 fn init_tracing() -> Result<()> {
     let filter = EnvFilter::try_from_default_env().or_else(|_| EnvFilter::try_new("info"))?;

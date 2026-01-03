@@ -34,6 +34,7 @@ pub struct Credentials {
 
 impl Cli {
     /// Parse command line arguments
+    #[must_use]
     pub fn parse_args() -> Self {
         Self::parse()
     }
@@ -43,6 +44,13 @@ impl Cli {
     /// Each argument can be either a direct value or a path to a file.
     /// If the value exists as a file, its contents will be read and trimmed.
     /// Otherwise, the value itself will be used.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - A file path is specified but cannot be read
+    /// - Credentials are invalid (empty or malformed)
+    /// - The server URL doesn't start with http:// or https://
     pub fn load_credentials(&self) -> Result<Credentials> {
         let server_url =
             load_value_or_file(&self.caldav_server).context("Failed to load CalDAV server URL")?;
