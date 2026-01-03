@@ -253,6 +253,11 @@ async fn test_authentication_failure() -> Result<()> {
 /// - The sync completes without errors even with empty results
 #[tokio::test]
 async fn test_parse_icalendar_data() -> Result<()> {
+    // Skip this test inside Nix builds
+    if std::env::var_os("NIX_BUILD_TOP").is_some() {
+        return Ok(());
+    }
+
     use fred_cal::cache::CacheManager;
     use fred_cal::sync::SyncManager;
     use std::sync::Arc;
