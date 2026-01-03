@@ -79,9 +79,15 @@ impl SyncManager {
         let calendars = self.client.list_calendars(home).await?;
         debug!("Found {} calendars", calendars.len());
 
-        let mut all_events = Vec::new();
-        let mut all_todos = Vec::new();
+        // Check if server supports WebDAV sync
+        let supports_sync = self.client.supports_webdav_sync().await.unwrap_or(false);
+        if supports_sync {
+            info!("Server supports WebDAV sync - using incremental updates");
+        } else {
+            info!("Server does not support WebDAV sync - using full sync");
+        }
 
+        // Process each calendar
         for calendar in &calendars {
             let calendar_name = calendar
                 .displayname
@@ -89,38 +95,39 @@ impl SyncManager {
                 .unwrap_or_else(|| "Unnamed".to_string());
             let calendar_url = calendar.href.clone();
 
-            debug!("Fetching objects from calendar: {}", calendar_name);
+            debug!("Syncing calendar: {}", calendar_name);
 
-            // Fetch all calendar objects (VEVENT and VTODO)
-            match self
-                .fetch_and_parse_calendar(&calendar_url, &calendar_name)
-                .await
-            {
-                Ok((mut events, mut todos)) => {
-                    debug!(
-                        "Parsed {} events and {} todos from {}",
-                        events.len(),
-                        todos.len(),
-                        calendar_name
-                    );
-                    all_events.append(&mut events);
-                    all_todos.append(&mut todos);
+            // Try incremental sync first if supported
+            let sync_result = if supports_sync {
+                self.sync_calendar_incremental(&calendar_url, &calendar_name)
+                    .await
+            } else {
+                Err(anyhow::anyhow!("WebDAV sync not supported"))
+            };
+
+            // Fall back to full sync if incremental fails
+            match sync_result {
+                Ok(()) => {
+                    debug!("Incremental sync successful for {}", calendar_name);
                 }
                 Err(e) => {
-                    error!(
-                        "Failed to fetch/parse calendar {} at {}: {:?}",
-                        calendar_name, calendar_url, e
+                    debug!(
+                        "Incremental sync failed for {} ({}), falling back to full sync",
+                        calendar_name, e
                     );
-                    // Continue with other calendars
+                    if let Err(e) = self.sync_calendar_full(&calendar_url, &calendar_name).await {
+                        error!(
+                            "Failed to sync calendar {} at {}: {:?}",
+                            calendar_name, calendar_url, e
+                        );
+                    }
                 }
             }
         }
 
-        // Update the in-memory data
+        // Update last sync time and save cache
         let (event_count, todo_count) = {
             let mut data = self.data.write().await;
-            data.events = all_events;
-            data.todos = all_todos;
             data.last_sync = Utc::now();
 
             let counts = (data.events.len(), data.todos.len());
@@ -138,6 +145,167 @@ impl SyncManager {
             todo_count,
             calendars.len()
         );
+
+        Ok(())
+    }
+
+    /// Perform incremental sync using `WebDAV` sync-collection
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the sync-collection query fails or sync token is invalid.
+    async fn sync_calendar_incremental(
+        &self,
+        calendar_url: &str,
+        calendar_name: &str,
+    ) -> Result<()> {
+        // Get sync token from cache
+        let sync_token = {
+            let data = self.data.read().await;
+            data.sync_tokens.get(calendar_url).cloned()
+        };
+
+        debug!(
+            "Incremental sync for {} with token: {:?}",
+            calendar_name,
+            sync_token.as_ref().map_or("none", |_| "present")
+        );
+
+        // Perform sync-collection query
+        let sync_response = self
+            .client
+            .sync_collection(calendar_url, sync_token.as_deref(), None, true)
+            .await?;
+
+        let mut added_events = 0;
+        let mut added_todos = 0;
+        let mut deleted_count = 0;
+
+        // Process each changed item
+        for item in &sync_response.items {
+            if item.is_deleted {
+                // Remove deleted items
+                let mut data = self.data.write().await;
+                let href = &item.href;
+
+                // Remove from events
+                let initial_len = data.events.len();
+                data.events
+                    .retain(|e| !href.ends_with(&format!("{}.ics", e.uid)));
+                deleted_count += initial_len - data.events.len();
+
+                // Remove from todos
+                let initial_len = data.todos.len();
+                data.todos
+                    .retain(|t| !href.ends_with(&format!("{}.ics", t.uid)));
+                deleted_count += initial_len - data.todos.len();
+
+                debug!("Deleted item: {}", href);
+                drop(data);
+            } else if let Some(ical_data) = &item.calendar_data {
+                // Parse and add/update item
+                match ical_data.parse::<Calendar>() {
+                    Ok(calendar) => {
+                        let etag = item.etag.clone();
+                        let mut data = self.data.write().await;
+
+                        // Process events
+                        for event_comp in calendar.events() {
+                            match parse_event(
+                                event_comp,
+                                calendar_name,
+                                calendar_url,
+                                etag.as_deref(),
+                            ) {
+                                Ok(event) => {
+                                    // Remove old version if exists
+                                    data.events.retain(|e| e.uid != event.uid);
+                                    data.events.push(event);
+                                    added_events += 1;
+                                }
+                                Err(e) => {
+                                    warn!("Failed to parse event: {}", e);
+                                }
+                            }
+                        }
+
+                        // Process todos
+                        for todo_comp in calendar.todos() {
+                            match parse_todo(
+                                todo_comp,
+                                calendar_name,
+                                calendar_url,
+                                etag.as_deref(),
+                            ) {
+                                Ok(todo) => {
+                                    // Remove old version if exists
+                                    data.todos.retain(|t| t.uid != todo.uid);
+                                    data.todos.push(todo);
+                                    added_todos += 1;
+                                }
+                                Err(e) => {
+                                    warn!("Failed to parse todo: {}", e);
+                                }
+                            }
+                        }
+                        drop(data);
+                    }
+                    Err(e) => {
+                        warn!("Failed to parse iCalendar data from {}: {}", item.href, e);
+                    }
+                }
+            }
+        }
+
+        // Store new sync token
+        if let Some(new_token) = sync_response.sync_token {
+            let mut data = self.data.write().await;
+            data.sync_tokens.insert(calendar_url.to_string(), new_token);
+            drop(data);
+        }
+
+        info!(
+            "Incremental sync for {}: +{} events, +{} todos, -{} deleted",
+            calendar_name, added_events, added_todos, deleted_count
+        );
+
+        Ok(())
+    }
+
+    /// Perform full sync of a calendar
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the calendar query fails or the `CalDAV` server is unreachable.
+    async fn sync_calendar_full(&self, calendar_url: &str, calendar_name: &str) -> Result<()> {
+        debug!("Full sync for {}", calendar_name);
+
+        // Fetch all calendar objects
+        let (events, todos) = self
+            .fetch_and_parse_calendar(calendar_url, calendar_name)
+            .await?;
+
+        debug!(
+            "Full sync for {}: fetched {} events and {} todos",
+            calendar_name,
+            events.len(),
+            todos.len()
+        );
+
+        // Replace all items for this calendar
+        let mut data = self.data.write().await;
+
+        // Remove old items from this calendar
+        data.events.retain(|e| e.calendar_url != calendar_url);
+        data.todos.retain(|t| t.calendar_url != calendar_url);
+
+        // Add new items
+        data.events.extend(events);
+        data.todos.extend(todos);
+
+        // Clear sync token for this calendar (will get new one on next incremental sync)
+        data.sync_tokens.remove(calendar_url);
+        drop(data);
 
         Ok(())
     }
