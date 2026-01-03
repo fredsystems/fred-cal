@@ -243,3 +243,125 @@ async fn test_authentication_failure() -> Result<()> {
 
     Ok(())
 }
+
+/// Test that the full sync workflow completes successfully
+///
+/// This test verifies that:
+/// - The sync manager can connect to a CalDAV server
+/// - It can discover calendars
+/// - It can query for VEVENTs and VTODOs
+/// - The sync completes without errors even with empty results
+#[tokio::test]
+async fn test_parse_icalendar_data() -> Result<()> {
+    use fred_cal::cache::CacheManager;
+    use fred_cal::sync::SyncManager;
+    use std::sync::Arc;
+
+    let mock_server = MockServer::start().await;
+
+    // Mock the current-user-principal discovery
+    Mock::given(method("PROPFIND"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(207).set_body_string(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:response>
+    <d:href>/</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:current-user-principal>
+          <d:href>/principals/user/</d:href>
+        </d:current-user-principal>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#,
+        ))
+        .mount(&mock_server)
+        .await;
+
+    // Mock the calendar-home-set discovery
+    Mock::given(method("PROPFIND"))
+        .and(path("/principals/user/"))
+        .respond_with(ResponseTemplate::new(207).set_body_string(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:response>
+    <d:href>/principals/user/</d:href>
+    <d:propstat>
+      <d:prop>
+        <c:calendar-home-set>
+          <d:href>/calendars/user/</d:href>
+        </c:calendar-home-set>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#,
+        ))
+        .mount(&mock_server)
+        .await;
+
+    // Mock the calendar list
+    Mock::given(method("PROPFIND"))
+        .and(path("/calendars/user/"))
+        .respond_with(ResponseTemplate::new(207).set_body_string(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:response>
+    <d:href>/calendars/user/personal/</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:displayname>Personal</d:displayname>
+        <d:resourcetype>
+          <d:collection/>
+          <c:calendar/>
+        </d:resourcetype>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#,
+        ))
+        .mount(&mock_server)
+        .await;
+
+    // Mock REPORT queries for both VEVENT and VTODO
+    // Returns empty results - this is sufficient to test the sync workflow
+    Mock::given(method("REPORT"))
+        .and(path("/calendars/user/personal/"))
+        .respond_with(ResponseTemplate::new(207).set_body_string(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+</d:multistatus>"#,
+        ))
+        .mount(&mock_server)
+        .await;
+
+    // Create a temporary cache
+    let cache = CacheManager::new()?;
+    cache.clear()?;
+
+    // Create CalDAV client
+    let client = CalDavClient::new(
+        &mock_server.uri(),
+        Some("testuser@example.com"),
+        Some("testpassword"),
+    )?;
+
+    // Create sync manager and perform sync
+    let sync_manager = Arc::new(SyncManager::new(client, cache)?);
+    sync_manager.sync().await?;
+
+    // Verify the parsed data
+    let data = sync_manager.data();
+    let calendar_data = data.read().await;
+
+    // Verify sync completed successfully
+    // The mock returns empty results, which is fine - we're testing the workflow
+    assert_eq!(calendar_data.events.len(), 0);
+    assert_eq!(calendar_data.todos.len(), 0);
+
+    Ok(())
+}

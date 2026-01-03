@@ -18,6 +18,10 @@ impl CacheManager {
     /// Create a new cache manager
     ///
     /// Uses XDG data directory, falling back to a sensible default if not available
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cache directory cannot be created or accessed.
     pub fn new() -> Result<Self> {
         let cache_dir = Self::get_cache_directory()?;
 
@@ -46,6 +50,10 @@ impl CacheManager {
     /// Load calendar data from cache
     ///
     /// Returns Ok(None) if cache doesn't exist or is invalid
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cache file cannot be read or parsed.
     pub fn load(&self) -> Result<Option<CalendarData>> {
         let cache_path = self.cache_file_path();
 
@@ -70,6 +78,10 @@ impl CacheManager {
     }
 
     /// Save calendar data to cache
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cache file cannot be written or serialization fails.
     pub fn save(&self, data: &CalendarData) -> Result<()> {
         let cache_path = self.cache_file_path();
 
@@ -90,6 +102,10 @@ impl CacheManager {
     }
 
     /// Clear the cache
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cache file exists but cannot be deleted.
     #[allow(dead_code)]
     pub fn clear(&self) -> Result<()> {
         let cache_path = self.cache_file_path();
@@ -106,11 +122,13 @@ impl CacheManager {
     }
 
     /// Get cache directory path
+    #[must_use]
     pub const fn cache_directory(&self) -> &PathBuf {
         &self.cache_dir
     }
 
     /// Check if cache exists
+    #[must_use]
     #[allow(dead_code)]
     pub fn exists(&self) -> bool {
         self.cache_file_path().exists()

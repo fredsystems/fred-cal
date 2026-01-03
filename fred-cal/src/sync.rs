@@ -4,10 +4,13 @@
 // https://opensource.org/licenses/MIT.
 
 use crate::cache::CacheManager;
-use crate::models::CalendarData;
+use crate::models::{CalendarData, CalendarEvent, Todo};
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{DateTime, TimeZone, Utc};
 use fast_dav_rs::CalDavClient;
+use icalendar::{
+    Calendar, CalendarDateTime, Component, DatePerhapsTime, Event, EventLike, Todo as IcalTodo,
+};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::{Duration, interval};
@@ -21,6 +24,10 @@ pub struct SyncManager {
 
 impl SyncManager {
     /// Create a new sync manager
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cache cannot be loaded from disk.
     pub fn new(client: CalDavClient, cache: CacheManager) -> Result<Self> {
         let data = cache.load()?.map_or_else(
             || {
@@ -41,11 +48,20 @@ impl SyncManager {
     }
 
     /// Get a read-only reference to the calendar data
+    #[must_use]
     pub fn data(&self) -> Arc<RwLock<CalendarData>> {
         Arc::clone(&self.data)
     }
 
     /// Perform a full sync with the `CalDAV` server
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The `CalDAV` server cannot be reached
+    /// - Authentication fails
+    /// - The server returns invalid data
+    /// - The cache cannot be saved to disk
     pub async fn sync(&self) -> Result<()> {
         info!("Starting calendar sync");
 
@@ -63,27 +79,41 @@ impl SyncManager {
         let calendars = self.client.list_calendars(home).await?;
         debug!("Found {} calendars", calendars.len());
 
-        // For now, we'll create placeholder data based on calendar names
-        // TODO: Implement actual iCal parsing when we can fetch calendar objects
-        let all_events = Vec::new();
-        let all_todos = Vec::new();
+        let mut all_events = Vec::new();
+        let mut all_todos = Vec::new();
 
         for calendar in &calendars {
             let calendar_name = calendar
                 .displayname
                 .clone()
                 .unwrap_or_else(|| "Unnamed".to_string());
-            let _calendar_url = calendar.href.clone();
+            let calendar_url = calendar.href.clone();
 
-            debug!("Found calendar: {}", calendar_name);
+            debug!("Fetching objects from calendar: {}", calendar_name);
 
-            // TODO: Fetch actual calendar objects and parse them
-            // For now, this is a stub that creates the structure without real data
-            // The actual implementation will need to:
-            // 1. Fetch calendar objects from the server
-            // 2. Parse iCalendar data (VEVENT and VTODO components)
-            // 3. Extract event and todo information
-            // 4. Store ETags for efficient syncing
+            // Fetch all calendar objects (VEVENT and VTODO)
+            match self
+                .fetch_and_parse_calendar(&calendar_url, &calendar_name)
+                .await
+            {
+                Ok((mut events, mut todos)) => {
+                    debug!(
+                        "Parsed {} events and {} todos from {}",
+                        events.len(),
+                        todos.len(),
+                        calendar_name
+                    );
+                    all_events.append(&mut events);
+                    all_todos.append(&mut todos);
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to fetch/parse calendar {} at {}: {:?}",
+                        calendar_name, calendar_url, e
+                    );
+                    // Continue with other calendars
+                }
+            }
         }
 
         // Update the in-memory data
@@ -125,13 +155,529 @@ impl SyncManager {
             }
         }
     }
+
+    /// Fetch calendar objects and parse them into events and todos
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the calendar query fails or the `CalDAV` server is unreachable.
+    async fn fetch_and_parse_calendar(
+        &self,
+        calendar_url: &str,
+        calendar_name: &str,
+    ) -> Result<(Vec<CalendarEvent>, Vec<Todo>)> {
+        let mut events = Vec::new();
+        let mut todos = Vec::new();
+
+        // Fetch VEVENTs (calendar events)
+        debug!("Querying VEVENTs from: {}", calendar_url);
+        match self
+            .client
+            .calendar_query_timerange(calendar_url, "VEVENT", None, None, true)
+            .await
+        {
+            Ok(objects) => {
+                debug!("Fetched {} VEVENTs from {}", objects.len(), calendar_name);
+                for obj in objects {
+                    if let Some(ical_data) = obj.calendar_data {
+                        let etag = obj.etag.clone();
+                        match ical_data.parse::<Calendar>() {
+                            Ok(calendar) => {
+                                for event_comp in calendar.events() {
+                                    match parse_event(
+                                        event_comp,
+                                        calendar_name,
+                                        calendar_url,
+                                        etag.as_deref(),
+                                    ) {
+                                        Ok(event) => events.push(event),
+                                        Err(e) => {
+                                            warn!("Failed to parse event: {}", e);
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to parse iCalendar data from {}: {}", obj.href, e);
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                debug!("Failed to query VEVENTs from {}: {:?}", calendar_url, e);
+                // Not an error - calendar might not have events
+            }
+        }
+
+        // Fetch VTODOs (tasks)
+        debug!("Querying VTODOs from: {}", calendar_url);
+        match self
+            .client
+            .calendar_query_timerange(calendar_url, "VTODO", None, None, true)
+            .await
+        {
+            Ok(objects) => {
+                debug!("Fetched {} VTODOs from {}", objects.len(), calendar_name);
+                for obj in objects {
+                    if let Some(ical_data) = obj.calendar_data {
+                        let etag = obj.etag.clone();
+                        match ical_data.parse::<Calendar>() {
+                            Ok(calendar) => {
+                                for todo_comp in calendar.todos() {
+                                    match parse_todo(
+                                        todo_comp,
+                                        calendar_name,
+                                        calendar_url,
+                                        etag.as_deref(),
+                                    ) {
+                                        Ok(todo) => todos.push(todo),
+                                        Err(e) => {
+                                            warn!("Failed to parse todo: {}", e);
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to parse iCalendar data from {}: {}", obj.href, e);
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                debug!("Failed to query VTODOs from {}: {:?}", calendar_url, e);
+                // Not an error - calendar might not have todos
+            }
+        }
+
+        Ok((events, todos))
+    }
+}
+
+/// Parse an iCalendar event component into a `CalendarEvent`
+fn parse_event(
+    event: &Event,
+    calendar_name: &str,
+    calendar_url: &str,
+    etag: Option<&str>,
+) -> Result<CalendarEvent> {
+    // UID is required
+    let uid = event
+        .get_uid()
+        .ok_or_else(|| anyhow::anyhow!("Event missing UID"))?
+        .to_string();
+
+    // Summary (title)
+    let summary = event.get_summary().unwrap_or("Untitled Event").to_string();
+
+    // Description
+    let description = event.get_description().map(String::from);
+
+    // Location
+    let location = event.get_location().map(String::from);
+
+    // Start time (required)
+    let start_opt = event.get_start();
+    let start = parse_datetime(start_opt.as_ref())
+        .ok_or_else(|| anyhow::anyhow!("Event missing start time"))?;
+
+    // End time (use start + 1 hour if not specified)
+    let end = event.get_end().map_or_else(
+        || start + chrono::Duration::hours(1),
+        |end_time| {
+            parse_datetime(Some(&end_time)).unwrap_or_else(|| start + chrono::Duration::hours(1))
+        },
+    );
+
+    // Check if all-day event (date without time)
+    let all_day = matches!(start_opt.as_ref(), Some(DatePerhapsTime::Date(_)));
+
+    // Recurrence rule
+    let rrule = event.property_value("RRULE").map(String::from);
+
+    // Status
+    let status = event.get_status().map(|s| format!("{s:?}"));
+
+    Ok(CalendarEvent {
+        uid,
+        summary,
+        description,
+        location,
+        start,
+        end,
+        calendar_name: calendar_name.to_string(),
+        calendar_url: calendar_url.to_string(),
+        all_day,
+        rrule,
+        status,
+        etag: etag.map(String::from),
+    })
+}
+
+/// Parse an iCalendar todo component into a `Todo`
+fn parse_todo(
+    todo: &IcalTodo,
+    calendar_name: &str,
+    calendar_url: &str,
+    etag: Option<&str>,
+) -> Result<Todo> {
+    // UID is required
+    let uid = todo
+        .get_uid()
+        .ok_or_else(|| anyhow::anyhow!("Todo missing UID"))?
+        .to_string();
+
+    // Summary (title)
+    let summary = todo.get_summary().unwrap_or("Untitled Task").to_string();
+
+    // Description
+    let description = todo.get_description().map(String::from);
+
+    // Due date
+    let due = todo.get_due().and_then(|d| parse_datetime(Some(&d)));
+
+    // Start date
+    let start = todo.get_start().and_then(|s| parse_datetime(Some(&s)));
+
+    // Completed date
+    let completed = todo.get_completed();
+
+    // Priority (1-9, where 1 is highest)
+    let priority = todo.get_priority().and_then(|p| {
+        if (1..=9).contains(&p) {
+            u8::try_from(p).ok()
+        } else {
+            None
+        }
+    });
+
+    // Percent complete (0-100)
+    let percent_complete = todo.get_percent_complete().and_then(|p| {
+        if (0..=100).contains(&p) {
+            Some(p)
+        } else {
+            None
+        }
+    });
+
+    // Status (default to NEEDS-ACTION if not specified)
+    let status = todo
+        .get_status()
+        .map_or_else(|| "NEEDS-ACTION".to_string(), |s| format!("{s:?}"));
+
+    Ok(Todo {
+        uid,
+        summary,
+        description,
+        due,
+        start,
+        completed,
+        priority,
+        percent_complete,
+        status,
+        calendar_name: calendar_name.to_string(),
+        calendar_url: calendar_url.to_string(),
+        etag: etag.map(String::from),
+    })
+}
+
+/// Parse a `DatePerhapsTime` into a UTC `DateTime`
+fn parse_datetime(date_time: Option<&DatePerhapsTime>) -> Option<DateTime<Utc>> {
+    match date_time? {
+        DatePerhapsTime::DateTime(CalendarDateTime::Utc(dt)) => Some(*dt),
+        DatePerhapsTime::DateTime(CalendarDateTime::Floating(naive)) => {
+            // Floating time - treat as UTC
+            Some(Utc.from_utc_datetime(naive))
+        }
+        DatePerhapsTime::DateTime(CalendarDateTime::WithTimezone { date_time, tzid: _ }) => {
+            // For now, treat as UTC (proper timezone handling would require tz database)
+            Some(Utc.from_utc_datetime(date_time))
+        }
+        DatePerhapsTime::Date(d) => {
+            // Date only (all-day event) - use midnight UTC
+            let naive_dt = d.and_hms_opt(0, 0, 0)?;
+            Some(Utc.from_utc_datetime(&naive_dt))
+        }
+    }
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+    use super::*;
+    use chrono::{Datelike, NaiveDateTime, Timelike};
+
     #[test]
-    fn test_sync_manager_placeholder() {
-        // Full integration tests for sync manager are in the integration test suite
-        // This placeholder exists to satisfy the module structure
+    fn test_parse_datetime_with_date() {
+        // Create a simple date
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 15).unwrap();
+        let dpt = DatePerhapsTime::Date(date);
+
+        let result = parse_datetime(Some(&dpt));
+        assert!(result.is_some());
+
+        let dt = result.unwrap();
+        assert_eq!(dt.year(), 2026);
+        assert_eq!(dt.month(), 1);
+        assert_eq!(dt.day(), 15);
     }
+
+    #[test]
+    fn test_parse_datetime_with_utc() {
+        let naive =
+            NaiveDateTime::parse_from_str("2026-01-15 14:30:00", "%Y-%m-%d %H:%M:%S").unwrap();
+        let dt = Utc.from_utc_datetime(&naive);
+        let cal_dt = CalendarDateTime::Utc(dt);
+        let dpt = DatePerhapsTime::DateTime(cal_dt);
+
+        let result = parse_datetime(Some(&dpt));
+        assert!(result.is_some());
+
+        let parsed = result.unwrap();
+        assert_eq!(parsed.year(), 2026);
+        assert_eq!(parsed.month(), 1);
+        assert_eq!(parsed.day(), 15);
+        assert_eq!(parsed.hour(), 14);
+        assert_eq!(parsed.minute(), 30);
+    }
+
+    #[test]
+    fn test_parse_datetime_with_floating() {
+        let naive =
+            NaiveDateTime::parse_from_str("2026-01-15 10:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
+        let cal_dt = CalendarDateTime::Floating(naive);
+        let dpt = DatePerhapsTime::DateTime(cal_dt);
+
+        let result = parse_datetime(Some(&dpt));
+        assert!(result.is_some());
+
+        let parsed = result.unwrap();
+        assert_eq!(parsed.year(), 2026);
+        assert_eq!(parsed.month(), 1);
+        assert_eq!(parsed.day(), 15);
+        assert_eq!(parsed.hour(), 10);
+        assert_eq!(parsed.minute(), 0);
+    }
+
+    #[test]
+    fn test_parse_datetime_none() {
+        let result = parse_datetime(None);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_event_basic() {
+        use icalendar::Event;
+
+        let event = Event::new()
+            .uid("event-123")
+            .summary("Test Event")
+            .description("This is a test")
+            .location("Test Location")
+            .starts(Utc.with_ymd_and_hms(2026, 3, 15, 10, 0, 0).unwrap())
+            .ends(Utc.with_ymd_and_hms(2026, 3, 15, 11, 0, 0).unwrap())
+            .done();
+
+        let result = parse_event(&event, "Test Calendar", "/calendar/test", None);
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        assert_eq!(parsed.uid, "event-123");
+        assert_eq!(parsed.summary, "Test Event");
+        assert_eq!(parsed.description, Some("This is a test".to_string()));
+        assert_eq!(parsed.location, Some("Test Location".to_string()));
+        assert_eq!(parsed.calendar_name, "Test Calendar");
+        assert_eq!(parsed.calendar_url, "/calendar/test");
+        assert!(!parsed.all_day);
+        assert_eq!(parsed.etag, None);
+    }
+
+    #[test]
+    fn test_parse_event_with_etag() {
+        use icalendar::Event;
+
+        let event = Event::new()
+            .uid("event-456")
+            .summary("Event with ETag")
+            .starts(Utc.with_ymd_and_hms(2026, 4, 1, 9, 0, 0).unwrap())
+            .ends(Utc.with_ymd_and_hms(2026, 4, 1, 10, 0, 0).unwrap())
+            .done();
+
+        let result = parse_event(&event, "Calendar", "/cal", Some("etag-123"));
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        assert_eq!(parsed.etag, Some("etag-123".to_string()));
+    }
+
+    #[test]
+    fn test_parse_event_all_day() {
+        use icalendar::Event;
+
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
+        let event = Event::new()
+            .uid("all-day-1")
+            .summary("All Day Event")
+            .all_day(date)
+            .done();
+
+        let result = parse_event(&event, "Calendar", "/cal", None);
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        assert_eq!(parsed.summary, "All Day Event");
+        assert!(parsed.all_day);
+    }
+
+    #[test]
+    fn test_parse_event_minimal() {
+        use icalendar::Event;
+
+        let event = Event::new()
+            .uid("minimal-1")
+            .starts(Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap())
+            .done();
+
+        let result = parse_event(&event, "Cal", "/c", None);
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        assert_eq!(parsed.summary, "Untitled Event");
+        assert_eq!(parsed.description, None);
+        assert_eq!(parsed.location, None);
+    }
+
+    #[test]
+    fn test_parse_todo_basic() {
+        use icalendar::Todo as IcalTodo;
+
+        let todo = IcalTodo::new()
+            .uid("todo-123")
+            .summary("Test Task")
+            .description("Do this thing")
+            .due(Utc.with_ymd_and_hms(2026, 3, 20, 17, 0, 0).unwrap())
+            .priority(5)
+            .percent_complete(50)
+            .done();
+
+        let result = parse_todo(&todo, "Tasks", "/tasks", None);
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        assert_eq!(parsed.uid, "todo-123");
+        assert_eq!(parsed.summary, "Test Task");
+        assert_eq!(parsed.description, Some("Do this thing".to_string()));
+        assert!(parsed.due.is_some());
+        assert_eq!(parsed.priority, Some(5));
+        assert_eq!(parsed.percent_complete, Some(50));
+        assert_eq!(parsed.calendar_name, "Tasks");
+        assert_eq!(parsed.calendar_url, "/tasks");
+    }
+
+    #[test]
+    fn test_parse_todo_minimal() {
+        use icalendar::Todo as IcalTodo;
+
+        let todo = IcalTodo::new().uid("todo-min").done();
+
+        let result = parse_todo(&todo, "Tasks", "/t", None);
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        assert_eq!(parsed.summary, "Untitled Task");
+        assert_eq!(parsed.description, None);
+        assert_eq!(parsed.due, None);
+        assert_eq!(parsed.start, None);
+        assert_eq!(parsed.completed, None);
+        assert_eq!(parsed.priority, None);
+        assert_eq!(parsed.percent_complete, None);
+        assert_eq!(parsed.status, "NEEDS-ACTION");
+    }
+
+    #[test]
+    fn test_parse_todo_completed() {
+        use icalendar::Todo as IcalTodo;
+
+        let completed_time = Utc.with_ymd_and_hms(2026, 3, 1, 15, 30, 0).unwrap();
+        let todo = IcalTodo::new()
+            .uid("todo-done")
+            .summary("Completed Task")
+            .completed(completed_time)
+            .percent_complete(100)
+            .done();
+
+        let result = parse_todo(&todo, "Tasks", "/tasks", Some("etag-456"));
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        assert_eq!(parsed.summary, "Completed Task");
+        assert_eq!(parsed.completed, Some(completed_time));
+        assert_eq!(parsed.percent_complete, Some(100));
+        assert_eq!(parsed.etag, Some("etag-456".to_string()));
+    }
+
+    #[test]
+    fn test_parse_todo_priority_bounds() {
+        use icalendar::Todo as IcalTodo;
+
+        // Valid priority (1-9)
+        let todo = IcalTodo::new().uid("p1").priority(1).done();
+        let result = parse_todo(&todo, "T", "/t", None);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().priority, Some(1));
+
+        // Priority 9 (edge case)
+        let todo = IcalTodo::new().uid("p9").priority(9).done();
+        let result = parse_todo(&todo, "T", "/t", None);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().priority, Some(9));
+    }
+
+    #[test]
+    fn test_parse_todo_percent_complete_bounds() {
+        use icalendar::Todo as IcalTodo;
+
+        // 0% complete
+        let todo = IcalTodo::new().uid("pc0").percent_complete(0).done();
+        let result = parse_todo(&todo, "T", "/t", None);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().percent_complete, Some(0));
+
+        // 100% complete
+        let todo = IcalTodo::new().uid("pc100").percent_complete(100).done();
+        let result = parse_todo(&todo, "T", "/t", None);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().percent_complete, Some(100));
+
+        // 50% complete
+        let todo = IcalTodo::new().uid("pc50").percent_complete(50).done();
+        let result = parse_todo(&todo, "T", "/t", None);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().percent_complete, Some(50));
+    }
+
+    #[test]
+    fn test_parse_datetime_with_timezone() {
+        let naive =
+            NaiveDateTime::parse_from_str("2026-07-04 18:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
+        let cal_dt = CalendarDateTime::WithTimezone {
+            date_time: naive,
+            tzid: "America/New_York".to_string(),
+        };
+        let dpt = DatePerhapsTime::DateTime(cal_dt);
+
+        let result = parse_datetime(Some(&dpt));
+        assert!(result.is_some());
+
+        let parsed = result.unwrap();
+        // Note: We treat it as UTC for now (proper tz handling would require tz database)
+        assert_eq!(parsed.year(), 2026);
+        assert_eq!(parsed.month(), 7);
+        assert_eq!(parsed.day(), 4);
+        assert_eq!(parsed.hour(), 18);
+        assert_eq!(parsed.minute(), 0);
+    }
+
+    // Full integration tests for sync manager are in the integration test suite
 }
