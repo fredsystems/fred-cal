@@ -97,6 +97,11 @@ pub struct CalendarData {
 
     /// Last sync timestamp
     pub last_sync: DateTime<Utc>,
+
+    /// Sync tokens per calendar for incremental updates
+    /// Maps calendar URL to sync token
+    #[serde(default)]
+    pub sync_tokens: std::collections::HashMap<String, String>,
 }
 
 impl CalendarData {
@@ -107,6 +112,7 @@ impl CalendarData {
             events: Vec::new(),
             todos: Vec::new(),
             last_sync: Utc::now(),
+            sync_tokens: std::collections::HashMap::new(),
         }
     }
 
