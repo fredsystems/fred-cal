@@ -17,7 +17,10 @@
 #[macro_use]
 extern crate tracing;
 
+mod cli;
+
 use anyhow::Result;
+use cli::Cli;
 use fast_dav_rs::CalDavClient;
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -37,10 +40,19 @@ fn init_tracing() -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing()?;
+
+    // Parse command line arguments
+    let cli = Cli::parse_args();
+
+    // Load and validate credentials
+    let credentials = cli.load_credentials()?;
+
+    info!("Connecting to CalDAV server: {}", credentials.server_url);
+
     let client = CalDavClient::new(
-        "test",       // The caldav URL
-        Some("test"), // The username
-        Some("test"), // The password
+        &credentials.server_url,
+        Some(&credentials.username),
+        Some(&credentials.password),
     )?;
 
     let principal = client
