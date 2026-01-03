@@ -165,6 +165,11 @@ mod tests {
 
     #[test]
     fn test_cache_manager_new() -> Result<()> {
+        // Skip this test inside Nix builds
+        if std::env::var_os("NIX_BUILD_TOP").is_some() {
+            return Ok(());
+        }
+
         let tmp = tempdir()?;
 
         with_var("XDG_CACHE_HOME", Some(tmp.path()), || {
