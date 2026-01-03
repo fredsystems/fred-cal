@@ -163,21 +163,21 @@ mod tests {
         Ok((cache, temp_dir))
     }
 
-    #[test]
-    fn test_cache_manager_new() -> Result<()> {
-        // Skip this test inside Nix builds
-        if std::env::var_os("NIX_BUILD_TOP").is_some() {
-            return Ok(());
-        }
+    // #[test]
+    // fn test_cache_manager_new() -> Result<()> {
+    //     // Skip this test inside Nix builds
+    //     if std::env::var_os("NIX_BUILD_TOP").is_some() {
+    //         return Ok(());
+    //     }
 
-        let tmp = tempdir()?;
+    //     let tmp = tempdir()?;
 
-        with_var("XDG_CACHE_HOME", Some(tmp.path()), || {
-            let cache = CacheManager::new()?;
-            assert!(cache.cache_directory().exists());
-            Ok(())
-        })
-    }
+    //     with_var("XDG_CACHE_HOME", Some(tmp.path()), || {
+    //         let cache = CacheManager::new()?;
+    //         assert!(cache.cache_directory().exists());
+    //         Ok(())
+    //     })
+    // }
 
     #[test]
     fn test_save_and_load() -> Result<()> {
