@@ -42,6 +42,13 @@ export CALDAV_SERVER="https://caldav.example.com"
 export CALDAV_USERNAME="user@example.com"
 export CALDAV_PASSWORD="your-password"
 ./target/release/fred-cal
+
+# Custom port (default is 3000)
+./target/release/fred-cal \
+  --caldav-server "https://caldav.example.com" \
+  --username "user@example.com" \
+  --password "your-password" \
+  --port 8080
 ```
 
 The server will:

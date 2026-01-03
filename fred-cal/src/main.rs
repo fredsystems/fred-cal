@@ -34,6 +34,7 @@ async fn main() -> Result<()> {
 
     // Parse command line arguments
     let cli = Cli::parse_args();
+    let port = cli.port;
 
     // Load and validate credentials
     let credentials = cli.load_credentials()?;
@@ -73,9 +74,10 @@ async fn main() -> Result<()> {
 
     // Create and start web server
     let app = create_router(calendar_data);
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
+    let bind_addr = format!("0.0.0.0:{port}");
+    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
 
-    info!("API server listening on http://0.0.0.0:3000");
+    info!("API server listening on http://{}", bind_addr);
     info!("Available endpoints:");
     info!("  - GET /api/health");
     info!("  - GET /api/get_today");
