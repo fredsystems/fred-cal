@@ -22,6 +22,10 @@ pub struct Cli {
     /// Password for `CalDAV` authentication (or path to file containing password)
     #[arg(long, env = "CALDAV_PASSWORD")]
     pub password: String,
+
+    /// Port for the API server to listen on
+    #[arg(long, env = "API_PORT", default_value = "3000")]
+    pub port: u16,
 }
 
 /// Credentials for `CalDAV` authentication

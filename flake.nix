@@ -103,6 +103,7 @@
                 markdownlint-cli2
                 cargo-deny
                 cargo-machete
+                typos
               ]
               ++ (chk.passthru.devPackages or [ ])
               ++ chk.enabledPackages;

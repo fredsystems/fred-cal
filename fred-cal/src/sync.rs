@@ -97,31 +97,42 @@ impl SyncManager {
 
             debug!("Syncing calendar: {}", calendar_name);
 
-            // Try incremental sync first if supported
-            let sync_result = if supports_sync {
+            // Check if this calendar has been synced before
+            let has_been_synced = {
+                let data = self.data.read().await;
+                // Calendar has been synced if we have any events/todos from it
+                data.events.iter().any(|e| e.calendar_url == calendar_url)
+                    || data.todos.iter().any(|t| t.calendar_url == calendar_url)
+                    || data.sync_tokens.contains_key(&calendar_url)
+            };
+
+            // Strategy:
+            // 1. First sync ever: Use full query (most reliable for initial data fetch)
+            // 2. All subsequent syncs: Use sync_collection if server supports it
+            let sync_result = if !has_been_synced {
+                debug!("First sync for {} - using full query", calendar_name);
+                self.sync_calendar_full(&calendar_url, &calendar_name).await
+            } else if supports_sync {
+                debug!(
+                    "Using sync_collection for {} (subsequent sync)",
+                    calendar_name
+                );
                 self.sync_calendar_incremental(&calendar_url, &calendar_name)
                     .await
             } else {
-                Err(anyhow::anyhow!("WebDAV sync not supported"))
+                debug!(
+                    "Using full sync for {} (no WebDAV sync support)",
+                    calendar_name
+                );
+                self.sync_calendar_full(&calendar_url, &calendar_name).await
             };
 
-            // Fall back to full sync if incremental fails
-            match sync_result {
-                Ok(()) => {
-                    debug!("Incremental sync successful for {}", calendar_name);
-                }
-                Err(e) => {
-                    debug!(
-                        "Incremental sync failed for {} ({}), falling back to full sync",
-                        calendar_name, e
-                    );
-                    if let Err(e) = self.sync_calendar_full(&calendar_url, &calendar_name).await {
-                        error!(
-                            "Failed to sync calendar {} at {}: {:?}",
-                            calendar_name, calendar_url, e
-                        );
-                    }
-                }
+            // Log any errors but continue with other calendars
+            if let Err(e) = sync_result {
+                error!(
+                    "Failed to sync calendar {} at {}: {:?}",
+                    calendar_name, calendar_url, e
+                );
             }
         }
 
@@ -177,83 +188,41 @@ impl SyncManager {
             .sync_collection(calendar_url, sync_token.as_deref(), None, true)
             .await?;
 
+        debug!(
+            "sync_collection returned {} items for {}",
+            sync_response.items.len(),
+            calendar_name
+        );
+
         let mut added_events = 0;
         let mut added_todos = 0;
         let mut deleted_count = 0;
 
         // Process each changed item
         for item in &sync_response.items {
+            debug!(
+                "Processing item: href={}, is_deleted={}, has_data={}",
+                item.href,
+                item.is_deleted,
+                item.calendar_data.is_some()
+            );
+
             if item.is_deleted {
-                // Remove deleted items
-                let mut data = self.data.write().await;
-                let href = &item.href;
-
-                // Remove from events
-                let initial_len = data.events.len();
-                data.events
-                    .retain(|e| !href.ends_with(&format!("{}.ics", e.uid)));
-                deleted_count += initial_len - data.events.len();
-
-                // Remove from todos
-                let initial_len = data.todos.len();
-                data.todos
-                    .retain(|t| !href.ends_with(&format!("{}.ics", t.uid)));
-                deleted_count += initial_len - data.todos.len();
-
-                debug!("Deleted item: {}", href);
-                drop(data);
+                deleted_count += self.process_deleted_item(&item.href).await;
             } else if let Some(ical_data) = &item.calendar_data {
-                // Parse and add/update item
-                match ical_data.parse::<Calendar>() {
-                    Ok(calendar) => {
-                        let etag = item.etag.clone();
-                        let mut data = self.data.write().await;
-
-                        // Process events
-                        for event_comp in calendar.events() {
-                            match parse_event(
-                                event_comp,
-                                calendar_name,
-                                calendar_url,
-                                etag.as_deref(),
-                            ) {
-                                Ok(event) => {
-                                    // Remove old version if exists
-                                    data.events.retain(|e| e.uid != event.uid);
-                                    data.events.push(event);
-                                    added_events += 1;
-                                }
-                                Err(e) => {
-                                    warn!("Failed to parse event: {}", e);
-                                }
-                            }
-                        }
-
-                        // Process todos
-                        for todo_comp in calendar.todos() {
-                            match parse_todo(
-                                todo_comp,
-                                calendar_name,
-                                calendar_url,
-                                etag.as_deref(),
-                            ) {
-                                Ok(todo) => {
-                                    // Remove old version if exists
-                                    data.todos.retain(|t| t.uid != todo.uid);
-                                    data.todos.push(todo);
-                                    added_todos += 1;
-                                }
-                                Err(e) => {
-                                    warn!("Failed to parse todo: {}", e);
-                                }
-                            }
-                        }
-                        drop(data);
-                    }
-                    Err(e) => {
-                        warn!("Failed to parse iCalendar data from {}: {}", item.href, e);
-                    }
-                }
+                let (events, todos) = self
+                    .process_calendar_item(
+                        ical_data,
+                        &item.href,
+                        item.etag.as_ref(),
+                        calendar_name,
+                        calendar_url,
+                    )
+                    .await;
+                added_events += events;
+                added_todos += todos;
+            } else {
+                debug!("Item {} has no calendar data", item.href);
             }
         }
 
@@ -303,8 +272,14 @@ impl SyncManager {
         data.events.extend(events);
         data.todos.extend(todos);
 
-        // Clear sync token for this calendar (will get new one on next incremental sync)
-        data.sync_tokens.remove(calendar_url);
+        // Mark this calendar as synced by adding an empty token
+        // This signals that next sync should try sync_collection
+        if self.client.supports_webdav_sync().await.unwrap_or(false) {
+            data.sync_tokens
+                .entry(calendar_url.to_string())
+                .or_insert_with(String::new);
+        }
+
         drop(data);
 
         Ok(())
@@ -320,6 +295,90 @@ impl SyncManager {
 
             if let Err(e) = self.sync().await {
                 error!("Periodic sync failed: {}", e);
+            }
+        }
+    }
+
+    /// Process a deleted item by removing it from events and todos
+    async fn process_deleted_item(&self, href: &str) -> usize {
+        let mut data = self.data.write().await;
+
+        // Remove from events
+        let initial_events = data.events.len();
+        data.events
+            .retain(|e| !href.ends_with(&format!("{}.ics", e.uid)));
+        let events_deleted = initial_events - data.events.len();
+
+        // Remove from todos
+        let initial_todos = data.todos.len();
+        data.todos
+            .retain(|t| !href.ends_with(&format!("{}.ics", t.uid)));
+        let todos_deleted = initial_todos - data.todos.len();
+
+        debug!("Deleted item: {}", href);
+        drop(data);
+
+        events_deleted + todos_deleted
+    }
+
+    /// Process a calendar item (parse and add/update events and todos)
+    async fn process_calendar_item(
+        &self,
+        ical_data: &str,
+        href: &str,
+        etag: Option<&String>,
+        calendar_name: &str,
+        calendar_url: &str,
+    ) -> (usize, usize) {
+        debug!("Parsing iCalendar data for {}", href);
+
+        match ical_data.parse::<Calendar>() {
+            Ok(calendar) => {
+                let mut data = self.data.write().await;
+                let mut events_added = 0;
+                let mut todos_added = 0;
+
+                // Process events
+                for event_comp in calendar.events() {
+                    match parse_event(
+                        event_comp,
+                        calendar_name,
+                        calendar_url,
+                        etag.map(String::as_str),
+                    ) {
+                        Ok(event) => {
+                            data.events.retain(|e| e.uid != event.uid);
+                            data.events.push(event);
+                            events_added += 1;
+                        }
+                        Err(e) => warn!("Failed to parse event: {}", e),
+                    }
+                }
+
+                // Process todos
+                for todo_comp in calendar.todos() {
+                    match parse_todo(
+                        todo_comp,
+                        calendar_name,
+                        calendar_url,
+                        etag.map(String::as_str),
+                    ) {
+                        Ok(todo) => {
+                            data.todos.retain(|t| t.uid != todo.uid);
+                            data.todos.push(todo);
+                            todos_added += 1;
+                        }
+                        Err(e) => warn!("Failed to parse todo: {}", e),
+                    }
+                }
+
+                drop(data);
+                (events_added, todos_added)
+            }
+            Err(e) => {
+                warn!("Failed to parse iCalendar data from {}: {}", href, e);
+                debug!("iCalendar data that failed to parse: {}", ical_data);
+                (0, 0)
             }
         }
     }

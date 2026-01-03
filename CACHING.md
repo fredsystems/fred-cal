@@ -51,44 +51,87 @@ This means your API has **zero downtime** even with large calendars!
 
 ## Sync Strategies
 
-### 1. Incremental Sync (WebDAV sync-collection)
+### 1. Initial Sync (calendar-query)
 
-**When**: Server supports WebDAV sync-collection protocol
+**When**:
+
+- **Very first sync** for a calendar (no cached data exists)
 
 **How it works**:
 
-1. Check if we have a sync token for each calendar
-2. Send `sync-collection` REPORT with the sync token
-3. Server returns only **changes since last sync**:
-   - New events/todos
-   - Modified events/todos
-   - Deleted events/todos
-4. Apply changes to in-memory data
-5. Store new sync token for next sync
+1. Query calendar for all VEVENT components
+2. Query calendar for all VTODO components
+3. Parse all returned iCalendar data
+4. Store all events and todos
+5. If server supports WebDAV sync, mark calendar for incremental sync next time
 
 **Benefits**:
 
-- ⚡ **Fast** - Only transfers changed items
-- 📉 **Low bandwidth** - Minimal data transfer
-- 🎯 **Efficient** - Processes only what changed
+- ✅ **Reliable** - Works with all CalDAV servers
+- ✅ **Complete** - Guarantees all data is fetched
+- ✅ **Compatible** - No dependencies on advanced features
 
 **Example log output**:
 
 ```shell
 INFO Server supports WebDAV sync - using incremental updates
-INFO Incremental sync for Personal: +2 events, +1 todos, -0 deleted
-INFO Incremental sync for Work: +0 events, +3 todos, -1 deleted
-INFO Sync complete: 156 events, 89 todos (from 5 calendars)
+DEBUG First sync for Personal - using full query
+DEBUG Fetched 142 VEVENTs from Personal
+DEBUG Fetched 67 VTODOs from Personal
+DEBUG Full sync for Personal: fetched 142 events and 67 todos
+INFO Sync complete: 142 events, 67 todos (from 1 calendars)
 ```
 
-### 2. Full Sync (calendar-query)
+### 2. Incremental Sync (WebDAV sync-collection)
 
 **When**:
 
-- Server doesn't support WebDAV sync
-- No sync token available (first sync)
-- Sync token is invalid/expired
-- Incremental sync fails
+- Server supports WebDAV sync-collection protocol
+- **AND** calendar has been synced at least once before
+
+**How it works**:
+
+**Second sync** (first incremental, no sync token yet):
+
+1. Send `sync-collection` REPORT with `sync_token = None`
+2. Server returns **all items** in the calendar + a sync token
+3. Apply changes to in-memory data
+4. Store sync token for next sync
+
+**Subsequent syncs** (have sync token):
+
+1. Send `sync-collection` REPORT with previous sync token
+2. Server returns only **changes since last sync**:
+   - New events/todos
+   - Modified events/todos
+   - Deleted events/todos
+3. Apply changes to in-memory data
+4. Store new sync token
+
+**Benefits**:
+
+- ⚡ **Very fast** - After second sync, only transfers changed items
+- 📉 **Low bandwidth** - Minimal data transfer on updates
+- 🎯 **Efficient** - Processes only what changed
+- 🔄 **Smart** - Handles additions, modifications, and deletions
+
+**Example log output**:
+
+```shell
+INFO Server supports WebDAV sync - using incremental updates
+DEBUG Using sync_collection for Personal (subsequent sync)
+INFO Incremental sync for Personal: +2 events, +1 todos, -0 deleted
+DEBUG Using sync_collection for Work (subsequent sync)
+INFO Incremental sync for Work: +0 events, +0 todos, -1 deleted
+INFO Sync complete: 144 events, 68 todos (from 2 calendars)
+```
+
+### 3. Full Sync (calendar-query) - Non-Sync Servers
+
+**When**:
+
+- Server doesn't support WebDAV sync-collection
+- **Every sync** on these servers (no incremental option)
 
 **How it works**:
 
@@ -96,20 +139,25 @@ INFO Sync complete: 156 events, 89 todos (from 5 calendars)
 2. Query calendar for all VTODO components
 3. Parse all returned iCalendar data
 4. **Replace** all items from that calendar
-5. Clear sync token (will try incremental next time)
+5. **No sync tokens** - every sync is a full sync
 
 **Benefits**:
 
 - ✅ **Always works** - Compatible with all CalDAV servers
 - 🔄 **Complete refresh** - Ensures data consistency
-- 🛡️ **Fallback safety** - Automatic recovery from sync errors
+- 🛡️ **Universal compatibility** - Works even on legacy servers
+
+**Drawback**:
+
+- ⚠️ **Slower** - Always fetches everything, even if nothing changed
 
 **Example log output**:
 
 ```shell
 INFO Server does not support WebDAV sync - using full sync
+DEBUG Using full sync for Personal (server doesn't support WebDAV sync)
 DEBUG Full sync for Personal: fetched 142 events and 67 todos
-INFO Sync complete: 156 events, 89 todos (from 5 calendars)
+INFO Sync complete: 142 events, 67 todos (from 1 calendars)
 ```
 
 ## Performance Characteristics
@@ -140,15 +188,21 @@ Load Cache ────→ API Available (with cached data)
   ↓
 Check Server Capabilities
   ├─→ Supports sync-collection?
-  │   ├─→ YES: Incremental Sync
-  │   │   ├─→ Have sync token?
-  │   │   │   ├─→ YES: Get only changes
-  │   │   │   └─→ NO: Fall back to full sync
-  │   │   ├─→ Success? → Save new sync token
-  │   │   └─→ Failed? → Fall back to full sync
+  │   ├─→ YES: Check if calendar has been synced before
+  │   │   ├─→ NO (first time): Use full query
+  │   │   │   └─→ Query all VEVENTs + VTODOs
+  │   │   │       └─→ Mark for incremental next time
+  │   │   │
+  │   │   └─→ YES (already synced): Use sync-collection
+  │   │       ├─→ Have sync token?
+  │   │       │   ├─→ YES: Send token
+  │   │       │   │   └─→ Get only changes + new token
+  │   │       │   │
+  │   │       │   └─→ NO: Send null token
+  │   │       │       └─→ Get all items + first token
   │   │
-  │   └─→ NO: Full Sync
-  │       └─→ Query all events + todos
+  │   └─→ NO: Use calendar-query (always)
+  │       └─→ Query all VEVENTs + VTODOs (no tokens)
   │
   ↓
 Update Cache
@@ -265,9 +319,11 @@ No risk of corrupted data causing crashes!
 
 ### For Large Calendars (1000+ items)
 
-- **Critical**: Incremental sync reduces sync time by 90%+
-- First sync after cache clear will be slow (one-time)
-- Subsequent syncs are fast
+- **Critical**: WebDAV sync-collection support is highly beneficial
+- **First sync**: Slow (fetches everything) - one-time, ~30-60 seconds
+- **Second sync**: Also slow (establishes baseline + gets token) - ~30 seconds
+- **Third+ syncs**: Very fast (only changes) - ~2-5 seconds - **90%+ improvement**
+- Without sync-collection support, every sync is slow (~30-60 seconds)
 
 ### For Multiple Calendars
 
@@ -279,9 +335,10 @@ No risk of corrupted data causing crashes!
 
 ### "Sync taking too long"
 
-1. Check if server supports WebDAV sync: Look for "using incremental updates" in logs
-2. Check network latency to CalDAV server
-3. Consider sync interval (default 15 minutes)
+1. Check if server supports WebDAV sync: Look for "using sync_collection" in logs
+2. If using full sync, first sync will be slow (expected)
+3. Check network latency to CalDAV server
+4. Consider sync interval (default 15 minutes) or increase it for large calendars
 
 ### "API serving stale data"
 
@@ -306,12 +363,34 @@ Potential improvements:
 5. **SQLite backend** - Better for very large calendars
 6. **Multi-level cache** - Recent items in memory, old items on disk
 
+## Configuration
+
+### Custom Port
+
+By default, the API server listens on port 3000. You can customize this:
+
+```bash
+# Command line argument
+fred-cal --port 8080 \
+  --caldav-server "https://caldav.example.com" \
+  --username "user@example.com" \
+  --password "your-password"
+
+# Environment variable
+export API_PORT=8080
+fred-cal --caldav-server "..." --username "..." --password "..."
+```
+
+The server will then be available at `http://0.0.0.0:8080` (or your chosen port).
+
 ## Monitoring
 
 Check sync health via API:
 
 ```bash
 curl http://localhost:3000/api/health
+# Or if using custom port:
+curl http://localhost:8080/api/health
 ```
 
 Response includes `last_sync` timestamp:

@@ -10,6 +10,10 @@ The `fred-cal` application provides command line options for connecting to a Cal
 - `--username <USERNAME>`: Username for CalDAV authentication
 - `--password <PASSWORD>`: Password for CalDAV authentication
 
+### Optional Arguments
+
+- `--port <PORT>`: Port for the API server to listen on (default: 3000)
+
 ### Environment Variables
 
 All arguments can also be provided via environment variables:
@@ -17,6 +21,7 @@ All arguments can also be provided via environment variables:
 - `CALDAV_SERVER`: CalDAV server URL
 - `CALDAV_USERNAME`: Username
 - `CALDAV_PASSWORD`: Password
+- `API_PORT`: API server port
 
 ### Usage Examples
 
@@ -26,7 +31,8 @@ All arguments can also be provided via environment variables:
 fred-cal \
   --caldav-server /run/secrets/email/icloud/caldav_server \
   --username /run/secrets/email/icloud/address \
-  --password /run/secrets/email/icloud/password
+  --password /run/secrets/email/icloud/password \
+  --port 8080
 ```
 
 #### Using Direct Values
@@ -35,7 +41,8 @@ fred-cal \
 fred-cal \
   --caldav-server "https://caldav.icloud.com" \
   --username "user@example.com" \
-  --password "your-password"
+  --password "your-password" \
+  --port 3000
 ```
 
 #### Using Environment Variables
@@ -44,7 +51,20 @@ fred-cal \
 export CALDAV_SERVER="/run/secrets/email/icloud/caldav_server"
 export CALDAV_USERNAME="/run/secrets/email/icloud/address"
 export CALDAV_PASSWORD="/run/secrets/email/icloud/password"
+export API_PORT=8080
 fred-cal
+```
+
+#### Using Default Port
+
+If you don't specify a port, the server will listen on port 3000:
+
+```bash
+fred-cal \
+  --caldav-server "https://caldav.icloud.com" \
+  --username "user@example.com" \
+  --password "your-password"
+# API server will listen on http://0.0.0.0:3000
 ```
 
 ### How File Loading Works
