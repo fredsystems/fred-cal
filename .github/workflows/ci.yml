@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  merge_group:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+jobs:
+  build-and-check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # --- Install Nix via Determinate Systems ---
+      - name: Set up Determinate Nix
+        uses: DeterminateSystems/determinate-nix-action@v3
+
+      - name: Use Determinate Cache
+        uses: DeterminateSystems/magic-nix-cache-action@v13
+
+      # --- Enter your flake's devShell (same behavior as direnv) ---
+      - name: Run checks in devShell
+        run: |
+          nix develop --impure --command bash -e -c '
+            set -euxo pipefail
+            pre-commit run --all-files
+          '
+
+  # Run cargo coverage. This will generate a coverage report and upload it to codecov.
+  coverage:
+    name: Coverage Report
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      # --- Install Nix ---
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2.8.1
+      - run: cargo xtask coverage
+      - uses: codecov/codecov-action@v5.5.1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: true
+
+  # Run cargo check. This is a fast way to catch any obvious errors in the code.
+  check:
+    name: Check ${{ matrix.os }} ${{ matrix.toolchain }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+        # We target 1.91.0 because it is the minimum supported version of Rust. If that build fails, or we rely on language features
+        # added in later versions, we'll have to bump the minimum version of rust.
+        toolchain: ["1.91.0", "stable", "nightly"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+      - uses: Swatinem/rust-cache@v2.8.1
+      - run: cargo xtask check
+
+  ci-success:
+    name: CI Success
+    runs-on: ubuntu-latest
+    needs:
+      - build-and-check
+      - coverage
+      - check
+    if: always()
+    steps:
+      - name: Verify all jobs succeeded
+        run: |
+          echo "build-and-check: ${{ needs.build-and-check.result }}"
+          echo "coverage:        ${{ needs.coverage.result }}"
+          echo "check:           ${{ needs.check.result }}"
+
+          if [[ "${{ needs.build-and-check.result }}" != "success" ]]; then
+            echo "❌ build-and-check failed"
+            exit 1
+          fi
+
+          if [[ "${{ needs.coverage.result }}" != "success" ]]; then
+            echo "❌ coverage failed"
+            exit 1
+          fi
+
+          if [[ "${{ needs.check.result }}" != "success" ]]; then
+            echo "❌ check matrix failed"
+            exit 1
+          fi
+
+          echo "✅ All CI jobs succeeded"

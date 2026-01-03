@@ -1,0 +1,31 @@
+[licenses]
+version = 2
+confidence-threshold = 0.8
+unused-allowed-license = "allow"
+allow = [
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "ISC",
+    "MIT",
+    "Zlib",
+    "Unicode-3.0",
+
+    # Crypto / TLS
+    "OpenSSL",
+    "CDLA-Permissive-2.0",
+
+    # Explicit copyleft acceptance
+    "LGPL-3.0-only",
+    "LGPL-3.0"
+]
+
+[advisories]
+version = 2
+
+[bans]
+multiple-versions = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
