@@ -17,11 +17,19 @@
 #[macro_use]
 extern crate tracing;
 
+mod api;
+mod cache;
 mod cli;
+mod models;
+mod sync;
 
 use anyhow::Result;
+use api::create_router;
+use cache::CacheManager;
 use cli::Cli;
 use fast_dav_rs::CalDavClient;
+use std::sync::Arc;
+use sync::SyncManager;
 use tracing_subscriber::{EnvFilter, fmt};
 
 fn init_tracing() -> Result<()> {
@@ -47,27 +55,56 @@ async fn main() -> Result<()> {
     // Load and validate credentials
     let credentials = cli.load_credentials()?;
 
-    info!("Connecting to CalDAV server: {}", credentials.server_url);
+    info!("Starting fred-cal CalDAV sync service");
+    info!("CalDAV server: {}", credentials.server_url);
 
+    // Initialize cache manager
+    let cache = CacheManager::new()?;
+    info!("Cache directory: {:?}", cache.cache_directory());
+
+    // Create CalDAV client
     let client = CalDavClient::new(
         &credentials.server_url,
         Some(&credentials.username),
         Some(&credentials.password),
     )?;
 
-    let principal = client
-        .discover_current_user_principal()
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("no principal returned"))?;
+    // Create sync manager
+    let sync_manager = Arc::new(SyncManager::new(client, cache)?);
 
-    let homes = client.discover_calendar_home_set(&principal).await?;
-    let Some(home) = homes.first() else {
-        return Err(anyhow::anyhow!("missing calendar-home-set"));
+    // Perform initial sync
+    info!("Performing initial sync...");
+    sync_manager.sync().await?;
+    info!("Initial sync complete");
+
+    // Get reference to calendar data for API
+    let calendar_data = sync_manager.data();
+
+    // Start background sync task (every 15 minutes)
+    let sync_handle = {
+        let sync_manager = Arc::clone(&sync_manager);
+        tokio::spawn(async move {
+            sync_manager.start_periodic_sync(15).await;
+        })
     };
 
-    for calendar in client.list_calendars(home).await? {
-        info!("Calendar: {:?}", calendar.displayname);
-    }
+    // Create and start web server
+    let app = create_router(calendar_data);
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
+
+    info!("API server listening on http://0.0.0.0:3000");
+    info!("Available endpoints:");
+    info!("  - GET /api/health");
+    info!("  - GET /api/get_today");
+    info!("  - GET /api/get_today_calendars");
+    info!("  - GET /api/get_today_todos");
+    info!("  - GET /api/get_date_range/:range");
+
+    // Run the server
+    axum::serve(listener, app).await?;
+
+    // Wait for background sync to complete (it won't, it runs forever)
+    sync_handle.await?;
 
     Ok(())
 }
