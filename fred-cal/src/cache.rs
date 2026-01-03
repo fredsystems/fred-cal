@@ -150,7 +150,9 @@ mod tests {
     use super::*;
     use crate::models::{CalendarEvent, Todo};
     use chrono::{TimeZone, Utc};
+    use temp_env::with_var;
     use tempfile::TempDir;
+    use tempfile::tempdir;
 
     // Helper to create a cache manager with a temporary directory
     fn create_test_cache_manager() -> Result<(CacheManager, TempDir)> {
@@ -163,9 +165,13 @@ mod tests {
 
     #[test]
     fn test_cache_manager_new() -> Result<()> {
-        let cache = CacheManager::new()?;
-        assert!(cache.cache_directory().exists());
-        Ok(())
+        let tmp = tempdir()?;
+
+        with_var("XDG_CACHE_HOME", Some(tmp.path()), || {
+            let cache = CacheManager::new()?;
+            assert!(cache.cache_directory().exists());
+            Ok(())
+        })
     }
 
     #[test]
