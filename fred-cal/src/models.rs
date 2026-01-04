@@ -464,4 +464,432 @@ mod tests {
         assert_eq!(filtered_events.len(), 1);
         assert_eq!(filtered_events[0].uid, "single-day");
     }
+
+    #[test]
+    fn test_todos_with_start_date_only() {
+        let mut data = CalendarData::new();
+
+        // Todo with start date but no due date
+        let todo = Todo {
+            uid: "start-only".to_string(),
+            summary: "Start Date Only".to_string(),
+            description: None,
+            due: None,
+            start: Some(
+                Utc.with_ymd_and_hms(2026, 1, 5, 12, 0, 0)
+                    .single()
+                    .expect("valid datetime"),
+            ),
+            completed: None,
+            priority: None,
+            percent_complete: None,
+            status: "IN-PROCESS".to_string(),
+            calendar_name: "Tasks".to_string(),
+            calendar_url: "/tasks".to_string(),
+            etag: None,
+        };
+
+        data.todos.push(todo);
+
+        let start = Utc
+            .with_ymd_and_hms(2026, 1, 5, 0, 0, 0)
+            .single()
+            .expect("valid datetime");
+        let end = Utc
+            .with_ymd_and_hms(2026, 1, 6, 0, 0, 0)
+            .single()
+            .expect("valid datetime");
+
+        let filtered_todos = data.todos_in_range(start, end);
+        assert_eq!(filtered_todos.len(), 1);
+        assert_eq!(filtered_todos[0].uid, "start-only");
+    }
+
+    #[test]
+    fn test_todos_without_dates() {
+        let mut data = CalendarData::new();
+
+        // Todo with neither due nor start date - should appear in all ranges
+        let todo = Todo {
+            uid: "no-dates".to_string(),
+            summary: "No Dates".to_string(),
+            description: Some("A task without dates".to_string()),
+            due: None,
+            start: None,
+            completed: None,
+            priority: Some(1),
+            percent_complete: Some(0),
+            status: "NEEDS-ACTION".to_string(),
+            calendar_name: "Tasks".to_string(),
+            calendar_url: "/tasks".to_string(),
+            etag: Some("etag123".to_string()),
+        };
+
+        data.todos.push(todo);
+
+        // Query any date range
+        let start = Utc
+            .with_ymd_and_hms(2026, 1, 5, 0, 0, 0)
+            .single()
+            .expect("valid datetime");
+        let end = Utc
+            .with_ymd_and_hms(2026, 1, 6, 0, 0, 0)
+            .single()
+            .expect("valid datetime");
+
+        let filtered_todos = data.todos_in_range(start, end);
+        assert_eq!(filtered_todos.len(), 1);
+        assert_eq!(filtered_todos[0].uid, "no-dates");
+    }
+
+    #[test]
+    fn test_calendar_event_partial_eq() {
+        let event1 = CalendarEvent {
+            uid: "test".to_string(),
+            summary: "Test Event".to_string(),
+            description: Some("Description".to_string()),
+            location: Some("Location".to_string()),
+            start: Utc
+                .with_ymd_and_hms(2026, 1, 5, 10, 0, 0)
+                .single()
+                .expect("valid datetime"),
+            end: Utc
+                .with_ymd_and_hms(2026, 1, 5, 11, 0, 0)
+                .single()
+                .expect("valid datetime"),
+            calendar_name: "Test".to_string(),
+            calendar_url: "/test".to_string(),
+            calendar_color: Some("#FF0000".to_string()),
+            all_day: false,
+            rrule: Some("FREQ=DAILY".to_string()),
+            status: Some("CONFIRMED".to_string()),
+            etag: Some("etag1".to_string()),
+        };
+
+        let event2 = event1.clone();
+        assert_eq!(event1, event2);
+
+        let mut event3 = event1.clone();
+        event3.uid = "different".to_string();
+        assert_ne!(event1, event3);
+    }
+
+    #[test]
+    fn test_todo_partial_eq() {
+        let todo1 = Todo {
+            uid: "test".to_string(),
+            summary: "Test Todo".to_string(),
+            description: Some("Description".to_string()),
+            due: Some(
+                Utc.with_ymd_and_hms(2026, 1, 10, 12, 0, 0)
+                    .single()
+                    .expect("valid datetime"),
+            ),
+            start: Some(
+                Utc.with_ymd_and_hms(2026, 1, 5, 9, 0, 0)
+                    .single()
+                    .expect("valid datetime"),
+            ),
+            completed: Some(Utc::now()),
+            priority: Some(5),
+            percent_complete: Some(75),
+            status: "IN-PROCESS".to_string(),
+            calendar_name: "Tasks".to_string(),
+            calendar_url: "/tasks".to_string(),
+            etag: Some("etag1".to_string()),
+        };
+
+        let todo2 = todo1.clone();
+        assert_eq!(todo1, todo2);
+
+        let mut todo3 = todo1.clone();
+        todo3.summary = "Different".to_string();
+        assert_ne!(todo1, todo3);
+    }
+
+    #[test]
+    fn test_calendar_data_default() {
+        let data = CalendarData::default();
+        assert!(data.events.is_empty());
+        assert!(data.todos.is_empty());
+        assert!(data.sync_tokens.is_empty());
+    }
+
+    #[test]
+    fn test_calendar_data_clone() {
+        let mut data = CalendarData::new();
+        data.events.push(CalendarEvent {
+            uid: "1".to_string(),
+            summary: "Event".to_string(),
+            description: None,
+            location: None,
+            start: Utc::now(),
+            end: Utc::now(),
+            calendar_name: "Test".to_string(),
+            calendar_url: "/test".to_string(),
+            calendar_color: None,
+            all_day: false,
+            rrule: None,
+            status: None,
+            etag: None,
+        });
+        data.sync_tokens
+            .insert("calendar1".to_string(), "token123".to_string());
+
+        let cloned = data.clone();
+        assert_eq!(cloned.events.len(), data.events.len());
+        assert_eq!(cloned.sync_tokens.len(), data.sync_tokens.len());
+        assert_eq!(
+            cloned.sync_tokens.get("calendar1"),
+            Some(&"token123".to_string())
+        );
+    }
+
+    #[test]
+    fn test_calendar_event_debug() {
+        let event = CalendarEvent {
+            uid: "test".to_string(),
+            summary: "Test Event".to_string(),
+            description: None,
+            location: None,
+            start: Utc
+                .with_ymd_and_hms(2026, 1, 5, 10, 0, 0)
+                .single()
+                .expect("valid datetime"),
+            end: Utc
+                .with_ymd_and_hms(2026, 1, 5, 11, 0, 0)
+                .single()
+                .expect("valid datetime"),
+            calendar_name: "Test".to_string(),
+            calendar_url: "/test".to_string(),
+            calendar_color: None,
+            all_day: false,
+            rrule: None,
+            status: None,
+            etag: None,
+        };
+
+        let debug_str = format!("{event:?}");
+        assert!(debug_str.contains("CalendarEvent"));
+        assert!(debug_str.contains("test"));
+    }
+
+    #[test]
+    fn test_todo_debug() {
+        let todo = Todo {
+            uid: "test".to_string(),
+            summary: "Test Todo".to_string(),
+            description: None,
+            due: None,
+            start: None,
+            completed: None,
+            priority: None,
+            percent_complete: None,
+            status: "NEEDS-ACTION".to_string(),
+            calendar_name: "Tasks".to_string(),
+            calendar_url: "/tasks".to_string(),
+            etag: None,
+        };
+
+        let debug_str = format!("{todo:?}");
+        assert!(debug_str.contains("Todo"));
+        assert!(debug_str.contains("test"));
+    }
+
+    #[test]
+    fn test_calendar_data_debug() {
+        let data = CalendarData::new();
+        let debug_str = format!("{data:?}");
+        assert!(debug_str.contains("CalendarData"));
+    }
+
+    #[test]
+    fn test_incomplete_todos_with_cancelled() {
+        let mut data = CalendarData::new();
+
+        let todo1 = Todo {
+            uid: "1".to_string(),
+            summary: "Active".to_string(),
+            description: None,
+            due: None,
+            start: None,
+            completed: None,
+            priority: None,
+            percent_complete: None,
+            status: "NEEDS-ACTION".to_string(),
+            calendar_name: "Tasks".to_string(),
+            calendar_url: "/tasks".to_string(),
+            etag: None,
+        };
+
+        let todo2 = Todo {
+            uid: "2".to_string(),
+            summary: "Cancelled".to_string(),
+            description: None,
+            due: None,
+            start: None,
+            completed: None,
+            priority: None,
+            percent_complete: None,
+            status: "CANCELLED".to_string(),
+            calendar_name: "Tasks".to_string(),
+            calendar_url: "/tasks".to_string(),
+            etag: None,
+        };
+
+        data.todos.push(todo1);
+        data.todos.push(todo2);
+
+        let incomplete = data.incomplete_todos();
+        assert_eq!(incomplete.len(), 1);
+        assert_eq!(incomplete[0].status, "NEEDS-ACTION");
+    }
+
+    #[test]
+    fn test_sync_tokens() {
+        let mut data = CalendarData::new();
+
+        data.sync_tokens
+            .insert("/calendar/1".to_string(), "sync-token-1".to_string());
+        data.sync_tokens
+            .insert("/calendar/2".to_string(), "sync-token-2".to_string());
+
+        assert_eq!(data.sync_tokens.len(), 2);
+        assert_eq!(
+            data.sync_tokens.get("/calendar/1"),
+            Some(&"sync-token-1".to_string())
+        );
+        assert_eq!(
+            data.sync_tokens.get("/calendar/2"),
+            Some(&"sync-token-2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_events_in_range_boundary_conditions() {
+        let mut data = CalendarData::new();
+
+        // Event that starts exactly at range start
+        let event1 = CalendarEvent {
+            uid: "1".to_string(),
+            summary: "Starts at boundary".to_string(),
+            description: None,
+            location: None,
+            start: Utc
+                .with_ymd_and_hms(2026, 1, 5, 0, 0, 0)
+                .single()
+                .expect("valid datetime"),
+            end: Utc
+                .with_ymd_and_hms(2026, 1, 5, 1, 0, 0)
+                .single()
+                .expect("valid datetime"),
+            calendar_name: "Test".to_string(),
+            calendar_url: "/test".to_string(),
+            calendar_color: None,
+            all_day: false,
+            rrule: None,
+            status: None,
+            etag: None,
+        };
+
+        // Event that ends exactly at range end
+        let event2 = CalendarEvent {
+            uid: "2".to_string(),
+            summary: "Ends at boundary".to_string(),
+            description: None,
+            location: None,
+            start: Utc
+                .with_ymd_and_hms(2026, 1, 5, 23, 0, 0)
+                .single()
+                .expect("valid datetime"),
+            end: Utc
+                .with_ymd_and_hms(2026, 1, 6, 0, 0, 0)
+                .single()
+                .expect("valid datetime"),
+            calendar_name: "Test".to_string(),
+            calendar_url: "/test".to_string(),
+            calendar_color: None,
+            all_day: false,
+            rrule: None,
+            status: None,
+            etag: None,
+        };
+
+        data.events.push(event1);
+        data.events.push(event2);
+
+        let start = Utc
+            .with_ymd_and_hms(2026, 1, 5, 0, 0, 0)
+            .single()
+            .expect("valid datetime");
+        let end = Utc
+            .with_ymd_and_hms(2026, 1, 6, 0, 0, 0)
+            .single()
+            .expect("valid datetime");
+
+        let filtered_events = data.events_in_range(start, end);
+        assert_eq!(filtered_events.len(), 2);
+    }
+
+    #[test]
+    fn test_todos_in_range_boundary_conditions() {
+        let mut data = CalendarData::new();
+
+        // Todo due exactly at range start
+        let todo1 = Todo {
+            uid: "1".to_string(),
+            summary: "Due at start".to_string(),
+            description: None,
+            due: Some(
+                Utc.with_ymd_and_hms(2026, 1, 5, 0, 0, 0)
+                    .single()
+                    .expect("valid datetime"),
+            ),
+            start: None,
+            completed: None,
+            priority: None,
+            percent_complete: None,
+            status: "NEEDS-ACTION".to_string(),
+            calendar_name: "Tasks".to_string(),
+            calendar_url: "/tasks".to_string(),
+            etag: None,
+        };
+
+        // Todo due exactly at range end (should not be included)
+        let todo2 = Todo {
+            uid: "2".to_string(),
+            summary: "Due at end".to_string(),
+            description: None,
+            due: Some(
+                Utc.with_ymd_and_hms(2026, 1, 6, 0, 0, 0)
+                    .single()
+                    .expect("valid datetime"),
+            ),
+            start: None,
+            completed: None,
+            priority: None,
+            percent_complete: None,
+            status: "NEEDS-ACTION".to_string(),
+            calendar_name: "Tasks".to_string(),
+            calendar_url: "/tasks".to_string(),
+            etag: None,
+        };
+
+        data.todos.push(todo1);
+        data.todos.push(todo2);
+
+        let start = Utc
+            .with_ymd_and_hms(2026, 1, 5, 0, 0, 0)
+            .single()
+            .expect("valid datetime");
+        let end = Utc
+            .with_ymd_and_hms(2026, 1, 6, 0, 0, 0)
+            .single()
+            .expect("valid datetime");
+
+        let filtered_todos = data.todos_in_range(start, end);
+        // Only todo1 should be included (due < end, not due == end)
+        assert_eq!(filtered_todos.len(), 1);
+        assert_eq!(filtered_todos[0].uid, "1");
+    }
 }
