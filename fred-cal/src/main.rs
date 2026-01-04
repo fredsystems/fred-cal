@@ -84,6 +84,7 @@ async fn main() -> Result<()> {
     info!("  - GET /api/get_today_calendars");
     info!("  - GET /api/get_today_todos");
     info!("  - GET /api/get_date_range/:range");
+    info!("  - GET /api/debug/events (diagnostic endpoint)");
 
     // Run the server
     axum::serve(listener, app).await?;

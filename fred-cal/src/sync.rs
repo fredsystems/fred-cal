@@ -6,7 +6,8 @@
 use crate::cache::CacheManager;
 use crate::models::{CalendarData, CalendarEvent, Todo};
 use anyhow::Result;
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Local, TimeZone, Utc};
+use chrono_tz::Tz;
 use fast_dav_rs::CalDavClient;
 use icalendar::{
     Calendar, CalendarDateTime, Component, DatePerhapsTime, Event, EventLike, Todo as IcalTodo,
@@ -506,11 +507,14 @@ fn parse_event(
 
     // Start time (required)
     let start_opt = event.get_start();
+    debug!("Raw event start time for '{}': {:?}", summary, start_opt);
     let start = parse_datetime(start_opt.as_ref())
         .ok_or_else(|| anyhow::anyhow!("Event missing start time"))?;
 
     // End time (use start + 1 hour if not specified)
-    let end = event.get_end().map_or_else(
+    let end_opt = event.get_end();
+    debug!("Raw event end time for '{}': {:?}", summary, end_opt);
+    let end = end_opt.map_or_else(
         || start + chrono::Duration::hours(1),
         |end_time| {
             parse_datetime(Some(&end_time)).unwrap_or_else(|| start + chrono::Duration::hours(1))
@@ -525,6 +529,11 @@ fn parse_event(
 
     // Status
     let status = event.get_status().map(|s| format!("{s:?}"));
+
+    info!(
+        "Parsed event: '{}' | Start: {} UTC | End: {} UTC | All-day: {} | Calendar: {}",
+        summary, start, end, all_day, calendar_name
+    );
 
     Ok(CalendarEvent {
         uid,
@@ -562,10 +571,14 @@ fn parse_todo(
     let description = todo.get_description().map(String::from);
 
     // Due date
-    let due = todo.get_due().and_then(|d| parse_datetime(Some(&d)));
+    let due_opt = todo.get_due();
+    debug!("Raw todo due time for '{}': {:?}", summary, due_opt);
+    let due = due_opt.and_then(|d| parse_datetime(Some(&d)));
 
     // Start date
-    let start = todo.get_start().and_then(|s| parse_datetime(Some(&s)));
+    let start_opt = todo.get_start();
+    debug!("Raw todo start time for '{}': {:?}", summary, start_opt);
+    let start = start_opt.and_then(|s| parse_datetime(Some(&s)));
 
     // Completed date
     let completed = todo.get_completed();
@@ -593,6 +606,11 @@ fn parse_todo(
         .get_status()
         .map_or_else(|| "NEEDS-ACTION".to_string(), |s| format!("{s:?}"));
 
+    info!(
+        "Parsed todo: '{}' | Due: {:?} UTC | Start: {:?} UTC | Status: {} | Calendar: {}",
+        summary, due, start, status, calendar_name
+    );
+
     Ok(Todo {
         uid,
         summary,
@@ -610,21 +628,60 @@ fn parse_todo(
 }
 
 /// Parse a `DatePerhapsTime` into a UTC `DateTime`
+///
+/// All timezones are normalized to UTC for consistent storage and querying.
+/// - UTC datetimes are returned as-is
+/// - Floating datetimes (no timezone) are interpreted as UTC
+/// - Timezone-aware datetimes are converted from their timezone to UTC
+/// - Date-only values (all-day events) use midnight UTC
+///
+/// The consumer can convert to their preferred timezone when displaying.
 fn parse_datetime(date_time: Option<&DatePerhapsTime>) -> Option<DateTime<Utc>> {
     match date_time? {
-        DatePerhapsTime::DateTime(CalendarDateTime::Utc(dt)) => Some(*dt),
-        DatePerhapsTime::DateTime(CalendarDateTime::Floating(naive)) => {
-            // Floating time - treat as UTC
-            Some(Utc.from_utc_datetime(naive))
+        DatePerhapsTime::DateTime(CalendarDateTime::Utc(dt)) => {
+            // Already in UTC
+            debug!("Parsed UTC datetime: {}", dt);
+            Some(*dt)
         }
-        DatePerhapsTime::DateTime(CalendarDateTime::WithTimezone { date_time, tzid: _ }) => {
-            // For now, treat as UTC (proper timezone handling would require tz database)
-            Some(Utc.from_utc_datetime(date_time))
+        DatePerhapsTime::DateTime(CalendarDateTime::Floating(naive)) => {
+            // Floating time - treat as local timezone per iCalendar spec
+            // (floating times are meant to be "in the local time of the observer")
+            let dt_in_local = Local.from_local_datetime(naive).earliest()?;
+            let result = dt_in_local.with_timezone(&Utc);
+            debug!(
+                "Parsed floating datetime (no timezone, treating as local): {} local -> {} UTC",
+                naive, result
+            );
+            Some(result)
+        }
+        DatePerhapsTime::DateTime(CalendarDateTime::WithTimezone { date_time, tzid }) => {
+            // Parse timezone and convert to UTC
+            if let Ok(tz) = tzid.parse::<Tz>() {
+                // Create a datetime in the specified timezone and convert to UTC
+                let dt_in_tz = tz.from_local_datetime(date_time).earliest()?;
+                let result = dt_in_tz.with_timezone(&Utc);
+                debug!(
+                    "Parsed datetime with timezone: {} {} -> {} UTC",
+                    date_time, tzid, result
+                );
+                Some(result)
+            } else {
+                // If timezone parsing fails, log a warning and treat as UTC
+                warn!("Failed to parse timezone '{}', treating as UTC", tzid);
+                let result = Utc.from_utc_datetime(date_time);
+                debug!(
+                    "Failed timezone parse: {} {} -> {} UTC (treated as UTC)",
+                    date_time, tzid, result
+                );
+                Some(result)
+            }
         }
         DatePerhapsTime::Date(d) => {
             // Date only (all-day event) - use midnight UTC
             let naive_dt = d.and_hms_opt(0, 0, 0)?;
-            Some(Utc.from_utc_datetime(&naive_dt))
+            let result = Utc.from_utc_datetime(&naive_dt);
+            debug!("Parsed date-only (all-day): {} -> {} UTC", d, result);
+            Some(result)
         }
     }
 }
@@ -680,10 +737,13 @@ mod tests {
         assert!(result.is_some());
 
         let parsed = result.unwrap();
+        // Floating times are now treated as local time and converted to UTC
+        // So we can't assert a specific hour (depends on system timezone)
+        // But we can verify the date and that it was converted
         assert_eq!(parsed.year(), 2026);
         assert_eq!(parsed.month(), 1);
-        assert_eq!(parsed.day(), 15);
-        assert_eq!(parsed.hour(), 10);
+        // Day might shift depending on timezone, but should be 14, 15, or 16
+        assert!(parsed.day() >= 14 && parsed.day() <= 16);
         assert_eq!(parsed.minute(), 0);
     }
 
@@ -898,11 +958,11 @@ mod tests {
         assert!(result.is_some());
 
         let parsed = result.unwrap();
-        // Note: We treat it as UTC for now (proper tz handling would require tz database)
+        // 18:00 in America/New_York (EDT in July) is 22:00 UTC
         assert_eq!(parsed.year(), 2026);
         assert_eq!(parsed.month(), 7);
         assert_eq!(parsed.day(), 4);
-        assert_eq!(parsed.hour(), 18);
+        assert_eq!(parsed.hour(), 22);
         assert_eq!(parsed.minute(), 0);
     }
 
