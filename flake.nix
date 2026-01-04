@@ -36,7 +36,14 @@
             version = "0.1.0";
 
             src = ./.;
-            cargoLock.lockFile = ./Cargo.lock;
+
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+
+              outputHashes = {
+                "fast-dav-rs-0.2.0" = pkgs.lib.fakeSha256;
+              };
+            };
 
             nativeBuildInputs = [
               pkgs.pkg-config
