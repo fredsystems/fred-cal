@@ -93,6 +93,15 @@ pub fn expand_recurring_event(
             continue;
         }
 
+        // Skip if this occurrence is in the EXDATE list
+        if is_excluded_by_exdate(&occurrence_start, &event.exdates) {
+            debug!(
+                "Skipping occurrence at {} due to EXDATE for event '{}'",
+                occurrence_start, event.summary
+            );
+            continue;
+        }
+
         // Create event instance for this occurrence
         let occurrence_end = occurrence_start + duration;
 
@@ -117,6 +126,23 @@ pub fn expand_recurring_event(
     }
 
     instances
+}
+
+/// Check if a datetime is excluded by EXDATE
+///
+/// # Arguments
+///
+/// * `occurrence` - The occurrence datetime to check
+/// * `exdates` - List of exception dates
+///
+/// # Returns
+///
+/// `true` if the occurrence should be excluded, `false` otherwise
+fn is_excluded_by_exdate(occurrence: &DateTime<Utc>, exdates: &[DateTime<Utc>]) -> bool {
+    exdates.iter().any(|exdate| {
+        // Compare dates, ignoring sub-second precision
+        occurrence.timestamp() == exdate.timestamp()
+    })
 }
 
 /// Parse an RRULE string into an `RRuleSet`
@@ -206,17 +232,43 @@ mod tests {
         rrule: Option<String>,
     ) -> CalendarEvent {
         CalendarEvent {
-            uid: "test-uid".to_string(),
+            uid: format!("test-{}", summary.to_lowercase().replace(' ', "-")),
             summary: summary.to_string(),
             description: None,
             location: None,
             start,
             end,
-            calendar_name: "Test".to_string(),
-            calendar_url: "/test".to_string(),
+            calendar_name: "Test Calendar".to_string(),
+            calendar_url: "/calendar/test".to_string(),
             calendar_color: None,
             all_day: false,
             rrule,
+            exdates: Vec::new(),
+            status: None,
+            etag: None,
+        }
+    }
+
+    fn create_test_event_with_exdates(
+        summary: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        rrule: Option<String>,
+        exdates: Vec<DateTime<Utc>>,
+    ) -> CalendarEvent {
+        CalendarEvent {
+            uid: format!("test-{}", summary.to_lowercase().replace(' ', "-")),
+            summary: summary.to_string(),
+            description: None,
+            location: None,
+            start,
+            end,
+            calendar_name: "Test Calendar".to_string(),
+            calendar_url: "/calendar/test".to_string(),
+            calendar_color: None,
+            all_day: false,
+            rrule,
+            exdates,
             status: None,
             etag: None,
         }
@@ -660,6 +712,7 @@ mod tests {
             calendar_color: Some("#0000FF".to_string()),
             all_day: false,
             rrule: Some("FREQ=DAILY;COUNT=2".to_string()),
+            exdates: Vec::new(),
             status: Some("CONFIRMED".to_string()),
             etag: Some("etag123".to_string()),
         };
@@ -743,5 +796,178 @@ mod tests {
                 "Instance should be after window start"
             );
         }
+    }
+
+    #[test]
+    fn test_expand_with_single_exdate() {
+        let start = Utc::now().date_naive().and_hms_opt(10, 0, 0).unwrap();
+        let start = Utc.from_utc_datetime(&start);
+        let end = start + chrono::Duration::hours(1);
+
+        // Create EXDATE for the second occurrence (tomorrow)
+        let second_occurrence = start + chrono::Duration::days(1);
+        let exdates = vec![second_occurrence];
+
+        let event = create_test_event_with_exdates(
+            "Daily with exception",
+            start,
+            end,
+            Some("FREQ=DAILY;COUNT=5".to_string()),
+            exdates,
+        );
+
+        let config = RecurrenceConfig {
+            expand_forward_days: 30,
+            expand_backward_days: 1,
+        };
+        let instances = expand_recurring_event(&event, &config);
+
+        // Should have 4 instances (5 - 1 excluded)
+        assert_eq!(instances.len(), 4);
+
+        // Verify the second occurrence is not in the list
+        for instance in &instances {
+            assert_ne!(
+                instance.start, second_occurrence,
+                "Excluded date should not appear in instances"
+            );
+        }
+    }
+
+    #[test]
+    fn test_expand_with_multiple_exdates() {
+        let start = Utc::now().date_naive().and_hms_opt(14, 0, 0).unwrap();
+        let start = Utc.from_utc_datetime(&start);
+        let end = start + chrono::Duration::hours(1);
+
+        // Exclude 2nd and 4th occurrences
+        let exdates = vec![
+            start + chrono::Duration::days(1),
+            start + chrono::Duration::days(3),
+        ];
+
+        let event = create_test_event_with_exdates(
+            "Weekly with exceptions",
+            start,
+            end,
+            Some("FREQ=DAILY;COUNT=7".to_string()),
+            exdates.clone(),
+        );
+
+        let config = RecurrenceConfig {
+            expand_forward_days: 30,
+            expand_backward_days: 1,
+        };
+        let instances = expand_recurring_event(&event, &config);
+
+        // Should have 5 instances (7 - 2 excluded)
+        assert_eq!(instances.len(), 5);
+
+        // Verify excluded dates are not in the list
+        for instance in &instances {
+            for exdate in &exdates {
+                assert_ne!(
+                    instance.start, *exdate,
+                    "Excluded date should not appear in instances"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_expand_with_exdate_outside_window() {
+        let start = Utc::now().date_naive().and_hms_opt(9, 0, 0).unwrap();
+        let start = Utc.from_utc_datetime(&start);
+        let end = start + chrono::Duration::hours(1);
+
+        // EXDATE far in the future (outside window)
+        let far_future = start + chrono::Duration::days(1000);
+        let exdates = vec![far_future];
+
+        let event = create_test_event_with_exdates(
+            "Daily event",
+            start,
+            end,
+            Some("FREQ=DAILY;COUNT=5".to_string()),
+            exdates,
+        );
+
+        let config = RecurrenceConfig {
+            expand_forward_days: 10,
+            expand_backward_days: 1,
+        };
+        let instances = expand_recurring_event(&event, &config);
+
+        // Should still have all instances in window since EXDATE is outside
+        assert_eq!(instances.len(), 5);
+    }
+
+    #[test]
+    fn test_expand_all_excluded_by_exdate() {
+        let start = Utc::now().date_naive().and_hms_opt(11, 0, 0).unwrap();
+        let start = Utc.from_utc_datetime(&start);
+        let end = start + chrono::Duration::hours(1);
+
+        // Exclude all occurrences
+        let exdates = vec![
+            start,
+            start + chrono::Duration::days(1),
+            start + chrono::Duration::days(2),
+        ];
+
+        let event = create_test_event_with_exdates(
+            "All excluded",
+            start,
+            end,
+            Some("FREQ=DAILY;COUNT=3".to_string()),
+            exdates,
+        );
+
+        let config = RecurrenceConfig {
+            expand_forward_days: 30,
+            expand_backward_days: 1,
+        };
+        let instances = expand_recurring_event(&event, &config);
+
+        // When all are excluded, should return original event as fallback
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].start, start);
+    }
+
+    #[test]
+    fn test_is_excluded_by_exdate() {
+        let dt1 = Utc.with_ymd_and_hms(2026, 3, 15, 10, 0, 0).unwrap();
+        let dt2 = Utc.with_ymd_and_hms(2026, 3, 16, 10, 0, 0).unwrap();
+        let dt3 = Utc.with_ymd_and_hms(2026, 3, 17, 10, 0, 0).unwrap();
+
+        let exdates = vec![dt1, dt3];
+
+        assert!(is_excluded_by_exdate(&dt1, &exdates));
+        assert!(!is_excluded_by_exdate(&dt2, &exdates));
+        assert!(is_excluded_by_exdate(&dt3, &exdates));
+    }
+
+    #[test]
+    fn test_expand_no_exdates() {
+        let start = Utc::now().date_naive().and_hms_opt(13, 0, 0).unwrap();
+        let start = Utc.from_utc_datetime(&start);
+        let end = start + chrono::Duration::hours(1);
+
+        let event = create_test_event_with_exdates(
+            "No exceptions",
+            start,
+            end,
+            Some("FREQ=DAILY;COUNT=3".to_string()),
+            Vec::new(),
+        );
+
+        let config = RecurrenceConfig {
+            expand_forward_days: 30,
+            expand_backward_days: 1,
+        };
+        let instances = expand_recurring_event(&event, &config);
+
+        // Should have all 3 instances
+        assert_eq!(instances.len(), 3);
     }
 }

@@ -42,6 +42,9 @@ pub struct CalendarEvent {
     /// Recurrence rule (if any)
     pub rrule: Option<String>,
 
+    /// Exception dates (EXDATE) for recurring events - dates to exclude
+    pub exdates: Vec<DateTime<Utc>>,
+
     /// Event status (CONFIRMED, TENTATIVE, CANCELLED)
     pub status: Option<String>,
 
@@ -204,6 +207,7 @@ mod tests {
             calendar_color: None,
             all_day: false,
             rrule: None,
+            exdates: Vec::new(),
             status: None,
             etag: None,
         };
@@ -214,11 +218,11 @@ mod tests {
             description: None,
             location: None,
             start: Utc
-                .with_ymd_and_hms(2026, 1, 10, 10, 0, 0)
+                .with_ymd_and_hms(2026, 1, 10, 14, 0, 0)
                 .single()
                 .expect("valid datetime"),
             end: Utc
-                .with_ymd_and_hms(2026, 1, 10, 11, 0, 0)
+                .with_ymd_and_hms(2026, 1, 10, 15, 0, 0)
                 .single()
                 .expect("valid datetime"),
             calendar_name: "Test".to_string(),
@@ -226,6 +230,7 @@ mod tests {
             calendar_color: None,
             all_day: false,
             rrule: None,
+            exdates: Vec::new(),
             status: None,
             etag: None,
         };
@@ -371,6 +376,7 @@ mod tests {
             calendar_color: None,
             all_day: true,
             rrule: None,
+            exdates: Vec::new(),
             status: None,
             etag: None,
         };
@@ -418,6 +424,7 @@ mod tests {
             calendar_color: None,
             all_day: true,
             rrule: None,
+            exdates: Vec::new(),
             status: None,
             etag: None,
         };
@@ -429,11 +436,11 @@ mod tests {
             description: None,
             location: None,
             start: Utc
-                .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+                .with_ymd_and_hms(2026, 1, 2, 0, 0, 0)
                 .single()
                 .expect("valid datetime"),
             end: Utc
-                .with_ymd_and_hms(2026, 1, 3, 7, 0, 0)
+                .with_ymd_and_hms(2026, 1, 3, 0, 0, 0)
                 .single()
                 .expect("valid datetime"),
             calendar_name: "Test".to_string(),
@@ -441,6 +448,7 @@ mod tests {
             calendar_color: None,
             all_day: true,
             rrule: None,
+            exdates: Vec::new(),
             status: None,
             etag: None,
         };
@@ -557,13 +565,14 @@ mod tests {
                 .with_ymd_and_hms(2026, 1, 5, 11, 0, 0)
                 .single()
                 .expect("valid datetime"),
-            calendar_name: "Test".to_string(),
-            calendar_url: "/test".to_string(),
+            calendar_name: "Calendar".to_string(),
+            calendar_url: "/calendar".to_string(),
             calendar_color: Some("#FF0000".to_string()),
             all_day: false,
-            rrule: Some("FREQ=DAILY".to_string()),
-            status: Some("CONFIRMED".to_string()),
-            etag: Some("etag1".to_string()),
+            rrule: None,
+            exdates: Vec::new(),
+            status: Some("Confirmed".to_string()),
+            etag: Some("etag123".to_string()),
         };
 
         let event2 = event1.clone();
@@ -630,6 +639,7 @@ mod tests {
             calendar_color: None,
             all_day: false,
             rrule: None,
+            exdates: Vec::new(),
             status: None,
             etag: None,
         });
@@ -665,6 +675,7 @@ mod tests {
             calendar_color: None,
             all_day: false,
             rrule: None,
+            exdates: Vec::new(),
             status: None,
             etag: None,
         };
@@ -788,6 +799,7 @@ mod tests {
             calendar_color: None,
             all_day: false,
             rrule: None,
+            exdates: Vec::new(),
             status: None,
             etag: None,
         };
@@ -811,6 +823,7 @@ mod tests {
             calendar_color: None,
             all_day: false,
             rrule: None,
+            exdates: Vec::new(),
             status: None,
             etag: None,
         };

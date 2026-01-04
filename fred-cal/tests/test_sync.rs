@@ -1062,9 +1062,8 @@ END:VCALENDAR</c:calendar-data>
 }
 
 /// Test recurring event with EXDATE (exception dates)
-/// NOTE: EXDATE is not currently parsed/handled by the recurrence module,
-/// so this test verifies that the event still expands to all COUNT instances.
-/// Future enhancement: Parse and apply EXDATE to exclude specific occurrences.
+/// Tests that EXDATE properties are correctly parsed from CalDAV responses
+/// and applied during recurrence expansion to exclude specific occurrences.
 #[tokio::test]
 async fn test_recurring_event_with_exdate() -> Result<(), Box<dyn std::error::Error>> {
     setup_rustls();
@@ -1142,9 +1141,17 @@ END:VCALENDAR</c:calendar-data>
     let data = sync_manager.data();
     let calendar_data = data.read().await;
 
-    // Currently EXDATE is not processed, so we get all 4 instances
-    // TODO: When EXDATE support is added, this should be 3 (4 - 1 excluded)
-    assert_eq!(calendar_data.events.len(), 4);
+    // Should have 3 instances (4 - 1 excluded by EXDATE)
+    assert_eq!(calendar_data.events.len(), 3);
+
+    // Verify that the excluded date is not in the results
+    let excluded_date = weekly_start + Duration::days(7);
+    for event in &calendar_data.events {
+        assert_ne!(
+            event.start, excluded_date,
+            "Event with EXDATE should be excluded from instances"
+        );
+    }
 
     Ok(())
 }

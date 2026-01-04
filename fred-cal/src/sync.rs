@@ -744,6 +744,9 @@ fn parse_event(
     // Recurrence rule
     let rrule = event.property_value("RRULE").map(String::from);
 
+    // Exception dates (EXDATE)
+    let exdates = parse_exdates(event);
+
     // Status
     let status = event.get_status().map(|s| format!("{s:?}"));
 
@@ -759,12 +762,104 @@ fn parse_event(
         calendar_color: calendar_color.map(String::from),
         all_day,
         rrule,
+        exdates,
         status,
         etag: etag.map(String::from),
     })
 }
 
 /// Parse an iCalendar todo component into a `Todo`
+/// Parse EXDATE properties from an event
+///
+/// Returns a vector of `DateTime<Utc>` representing dates to exclude from recurrence
+fn parse_exdates(event: &Event) -> Vec<DateTime<Utc>> {
+    use icalendar::Component;
+
+    let mut exdates = Vec::new();
+
+    // Get all EXDATE properties (there can be multiple EXDATE lines)
+    if let Some(exdate_props) = event.multi_properties().get("EXDATE") {
+        for property in exdate_props {
+            let value = property.value();
+            // EXDATE can be a comma-separated list or a single value
+            for date_str in value.split(',') {
+                let trimmed = date_str.trim();
+
+                // Try to parse as datetime with timezone info
+                if let Some(dt) = parse_exdate_value(trimmed) {
+                    exdates.push(dt);
+                } else {
+                    debug!("Failed to parse EXDATE value: {}", trimmed);
+                }
+            }
+        }
+    }
+
+    exdates
+}
+
+/// Parse a single EXDATE value to `DateTime<Utc>`
+fn parse_exdate_value(value: &str) -> Option<DateTime<Utc>> {
+    // Format: YYYYMMDDTHHMMSSZ or YYYYMMDD
+
+    // Remove any timezone prefix (e.g., "TZID=America/New_York:")
+    let clean_value = value
+        .find(':')
+        .map_or(value, |colon_pos| &value[colon_pos + 1..]);
+
+    // Try to parse as UTC datetime (YYYYMMDDTHHmmssZ)
+    if clean_value.ends_with('Z') && clean_value.len() == 16 {
+        let date_part = &clean_value[0..8];
+        let time_part = &clean_value[9..15];
+
+        if let (Ok(year), Ok(month), Ok(day), Ok(hour), Ok(min), Ok(sec)) = (
+            date_part[0..4].parse::<i32>(),
+            date_part[4..6].parse::<u32>(),
+            date_part[6..8].parse::<u32>(),
+            time_part[0..2].parse::<u32>(),
+            time_part[2..4].parse::<u32>(),
+            time_part[4..6].parse::<u32>(),
+        ) {
+            return Utc
+                .with_ymd_and_hms(year, month, day, hour, min, sec)
+                .single();
+        }
+    }
+
+    // Try to parse as date only (YYYYMMDD) - treat as midnight UTC
+    if clean_value.len() == 8
+        && clean_value.chars().all(|c| c.is_ascii_digit())
+        && let (Ok(year), Ok(month), Ok(day)) = (
+            clean_value[0..4].parse::<i32>(),
+            clean_value[4..6].parse::<u32>(),
+            clean_value[6..8].parse::<u32>(),
+        )
+    {
+        return Utc.with_ymd_and_hms(year, month, day, 0, 0, 0).single();
+    }
+
+    // Try to parse as datetime without Z (YYYYMMDDTHHmmss)
+    if clean_value.contains('T') && clean_value.len() == 15 {
+        let date_part = &clean_value[0..8];
+        let time_part = &clean_value[9..15];
+
+        if let (Ok(year), Ok(month), Ok(day), Ok(hour), Ok(min), Ok(sec)) = (
+            date_part[0..4].parse::<i32>(),
+            date_part[4..6].parse::<u32>(),
+            date_part[6..8].parse::<u32>(),
+            time_part[0..2].parse::<u32>(),
+            time_part[2..4].parse::<u32>(),
+            time_part[4..6].parse::<u32>(),
+        ) {
+            return Utc
+                .with_ymd_and_hms(year, month, day, hour, min, sec)
+                .single();
+        }
+    }
+
+    None
+}
+
 fn parse_todo(
     todo: &IcalTodo,
     calendar_name: &str,
@@ -1707,6 +1802,37 @@ mod tests {
 
         let parsed = result.unwrap();
         assert_eq!(parsed.status, Some("Tentative".to_string()));
+    }
+
+    #[test]
+    fn test_parse_event_with_exdate() {
+        let ical_str = r"BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:test-exdate
+DTSTART:20260101T100000Z
+DTEND:20260101T110000Z
+SUMMARY:Event with EXDATE
+RRULE:FREQ=WEEKLY;COUNT=4
+EXDATE:20260108T100000Z
+END:VEVENT
+END:VCALENDAR";
+
+        let calendar = ical_str.parse::<Calendar>().unwrap();
+        let events: Vec<_> = calendar.events().collect();
+        assert_eq!(events.len(), 1);
+
+        let result = parse_event(events[0], "Test", "/test", None, None);
+        assert!(result.is_ok());
+
+        let event = result.unwrap();
+        assert_eq!(event.uid, "test-exdate");
+        assert_eq!(event.rrule, Some("FREQ=WEEKLY;COUNT=4".to_string()));
+        assert_eq!(event.exdates.len(), 1);
+
+        // Verify the EXDATE was parsed correctly
+        let expected_exdate = Utc.with_ymd_and_hms(2026, 1, 8, 10, 0, 0).unwrap();
+        assert_eq!(event.exdates[0], expected_exdate);
     }
 
     #[test]
