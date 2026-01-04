@@ -49,7 +49,15 @@ impl SyncManager {
                 Arc::new(RwLock::new(CalendarData::new()))
             },
             |cached_data| {
-                info!("Loaded existing cache");
+                info!(
+                    "Loaded existing cache: {} events, {} todos, {} calendars with sync tokens",
+                    cached_data.events.len(),
+                    cached_data.todos.len(),
+                    cached_data.sync_tokens.len()
+                );
+                for (url, token) in &cached_data.sync_tokens {
+                    debug!("  Calendar {}: token = {}", url, token);
+                }
                 Arc::new(RwLock::new(cached_data))
             },
         );
@@ -143,22 +151,25 @@ impl SyncManager {
 
             debug!("Syncing calendar: {}", calendar_name);
 
-            // Check if this calendar has been synced before
-            let has_been_synced = {
+            // Check if this calendar has been synced before and has a sync token
+            let (has_been_synced, has_sync_token) = {
                 let data = self.data.read().await;
-                // Calendar has been synced if we have any events/todos from it
-                data.events.iter().any(|e| e.calendar_url == calendar_url)
-                    || data.todos.iter().any(|t| t.calendar_url == calendar_url)
-                    || data.sync_tokens.contains_key(&calendar_url)
+                let synced = data.events.iter().any(|e| e.calendar_url == calendar_url)
+                    || data.todos.iter().any(|t| t.calendar_url == calendar_url);
+                let token = data.sync_tokens.get(&calendar_url);
+                // Don't use incremental sync if token is "NO_SYNC"
+                let has_token = token.is_some() && token != Some(&"NO_SYNC".to_string());
+                (synced, has_token)
             };
 
             // Strategy:
             // 1. First sync ever: Use full query (most reliable for initial data fetch)
-            // 2. All subsequent syncs: Use sync_collection if server supports it
+            // 2. Has sync token: Use sync_collection (incremental)
+            // 3. Has been synced but no token: Server doesn't support sync tokens, use full sync
             let sync_result = if !has_been_synced {
                 debug!("First sync for {} - using full query", calendar_name);
                 self.sync_calendar_full(&calendar_url, &calendar_name).await
-            } else if supports_sync {
+            } else if supports_sync && has_sync_token {
                 debug!(
                     "Using sync_collection for {} (subsequent sync)",
                     calendar_name
@@ -167,7 +178,7 @@ impl SyncManager {
                     .await
             } else {
                 debug!(
-                    "Using full sync for {} (no WebDAV sync support)",
+                    "Using full sync for {} (no sync token support or not supported by server)",
                     calendar_name
                 );
                 self.sync_calendar_full(&calendar_url, &calendar_name).await
@@ -486,12 +497,24 @@ impl SyncManager {
         };
 
         // Convert empty string to None (empty string is just a marker that calendar has been synced)
-        let sync_token = sync_token.and_then(|t| if t.is_empty() { None } else { Some(t) });
+        // If token is "NO_SYNC", this calendar should never use incremental sync
+        let sync_token = sync_token.and_then(|t| {
+            if t.is_empty() {
+                None
+            } else if t == "NO_SYNC" {
+                // This shouldn't happen - NO_SYNC should prevent us from getting here
+                None
+            } else {
+                Some(t)
+            }
+        });
 
-        debug!(
-            "Incremental sync for {} with token: {:?}",
+        info!(
+            "Incremental sync for {} with token: {}",
             calendar_name,
-            sync_token.as_ref().map_or("none", |_| "present")
+            sync_token
+                .as_ref()
+                .map_or("none (first incremental sync)", |t| t)
         );
 
         // Perform sync-collection query
@@ -500,10 +523,15 @@ impl SyncManager {
             .sync_collection(calendar_url, sync_token.as_deref(), None, true)
             .await?;
 
-        debug!(
+        info!(
             "sync_collection returned {} items for {}",
             sync_response.items.len(),
             calendar_name
+        );
+        debug!(
+            "sync_collection response details: sync_token={:?}, items_count={}",
+            sync_response.sync_token,
+            sync_response.items.len()
         );
 
         let mut added_events = 0;
@@ -513,7 +541,7 @@ impl SyncManager {
         // Process each changed item
         for item in &sync_response.items {
             debug!(
-                "Processing item: href={}, is_deleted={}, has_data={}",
+                "Processing sync item: href={}, is_deleted={}, has_data={}",
                 item.href,
                 item.is_deleted,
                 item.calendar_data.is_some()
@@ -534,14 +562,32 @@ impl SyncManager {
                 added_events += events;
                 added_todos += todos;
             } else {
-                debug!("Item {} has no calendar data", item.href);
+                warn!(
+                    "Item {} has no calendar data - server did not include data in sync-collection response",
+                    item.href
+                );
             }
         }
 
         // Store new sync token
-        if let Some(new_token) = sync_response.sync_token {
+        if let Some(new_token) = &sync_response.sync_token {
+            info!(
+                "Storing new sync token for {}: {}",
+                calendar_name, new_token
+            );
             let mut data = self.data.write().await;
-            data.sync_tokens.insert(calendar_url.to_string(), new_token);
+            data.sync_tokens
+                .insert(calendar_url.to_string(), new_token.clone());
+            drop(data);
+        } else {
+            warn!(
+                "No sync token returned for {} - server doesn't support sync tokens, marking to never use incremental sync",
+                calendar_name
+            );
+            // Store special marker "NO_SYNC" to prevent trying incremental sync again
+            let mut data = self.data.write().await;
+            data.sync_tokens
+                .insert(calendar_url.to_string(), "NO_SYNC".to_string());
             drop(data);
         }
 
@@ -587,10 +633,15 @@ impl SyncManager {
         // Mark this calendar as synced by adding an empty token
         // This signals that next sync should try sync_collection
         // The empty string will be converted to None in sync_calendar_incremental
+        // If the server doesn't return a token, it will be marked with "NO_SYNC"
+        // Don't overwrite "NO_SYNC" marker - those calendars should always use full sync
         if self.client.supports_webdav_sync().await.unwrap_or(false) {
-            data.sync_tokens
-                .entry(calendar_url.to_string())
-                .or_insert_with(String::new);
+            let current_token = data.sync_tokens.get(calendar_url);
+            if current_token != Some(&"NO_SYNC".to_string()) {
+                data.sync_tokens
+                    .entry(calendar_url.to_string())
+                    .or_insert_with(String::new);
+            }
         }
 
         drop(data);
