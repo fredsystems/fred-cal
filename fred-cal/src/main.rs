@@ -134,7 +134,7 @@ async fn main() -> Result<()> {
     };
 
     // Create and start web server
-    let app = create_router(calendar_data);
+    let app = create_router(calendar_data, Some(Arc::clone(&sync_manager)));
     let bind_addr = format!("0.0.0.0:{port}");
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
 
@@ -146,6 +146,7 @@ async fn main() -> Result<()> {
     info!("  - GET /api/get_today_todos");
     info!("  - GET /api/get_date_range/:range");
     info!("  - GET /api/debug/events (diagnostic endpoint)");
+    info!("  - POST /api/sync (trigger manual sync)");
 
     // Run the server
     axum::serve(listener, app).await?;

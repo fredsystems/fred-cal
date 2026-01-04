@@ -4,12 +4,13 @@
 // https://opensource.org/licenses/MIT.
 
 use crate::models::CalendarData;
+use crate::sync::SyncManager;
 use axum::{
     Router,
     extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Json, Response},
-    routing::get,
+    routing::{get, post},
 };
 use chrono::{DateTime, Duration, Local, NaiveDate, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
@@ -52,11 +53,15 @@ struct ErrorResponse {
 #[derive(Clone)]
 pub struct AppState {
     pub data: Arc<RwLock<CalendarData>>,
+    pub sync_manager: Option<Arc<SyncManager>>,
 }
 
 /// Create the API router with all endpoints
-pub fn create_router(data: Arc<RwLock<CalendarData>>) -> Router {
-    let state = AppState { data };
+pub fn create_router(
+    data: Arc<RwLock<CalendarData>>,
+    sync_manager: Option<Arc<SyncManager>>,
+) -> Router {
+    let state = AppState { data, sync_manager };
 
     Router::new()
         .route("/api/get_today", get(get_today))
@@ -65,6 +70,7 @@ pub fn create_router(data: Arc<RwLock<CalendarData>>) -> Router {
         .route("/api/get_date_range/{range}", get(get_date_range))
         .route("/api/debug/events", get(debug_events))
         .route("/api/health", get(health_check))
+        .route("/api/sync", post(trigger_sync))
         .with_state(state)
         .layer(
             TraceLayer::new_for_http()
@@ -429,6 +435,45 @@ impl IntoResponse for ApiError {
         let body = Json(ErrorResponse { error: message });
 
         (status, body).into_response()
+    }
+}
+
+/// Trigger a manual sync
+async fn trigger_sync(State(state): State<AppState>) -> Response {
+    match &state.sync_manager {
+        Some(sync_manager) => {
+            info!("Manual sync triggered via API");
+            match sync_manager.sync().await {
+                Ok(()) => {
+                    let data = state.data.read().await;
+                    Json(serde_json::json!({
+                        "status": "success",
+                        "message": "Sync completed successfully",
+                        "events": data.events.len(),
+                        "todos": data.todos.len(),
+                        "last_sync": data.last_sync
+                    }))
+                    .into_response()
+                }
+                Err(e) => {
+                    error!("Manual sync failed: {:?}", e);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: format!("Sync failed: {}", e),
+                        }),
+                    )
+                        .into_response()
+                }
+            }
+        }
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "Sync manager not available".to_string(),
+            }),
+        )
+            .into_response(),
     }
 }
 
