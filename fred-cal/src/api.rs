@@ -460,7 +460,7 @@ async fn trigger_sync(State(state): State<AppState>) -> Response {
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         Json(ErrorResponse {
-                            error: format!("Sync failed: {}", e),
+                            error: format!("Sync failed: {e}"),
                         }),
                     )
                         .into_response()

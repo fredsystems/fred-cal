@@ -10,14 +10,16 @@ use anyhow::Result;
 use chrono::{DateTime, Local, TimeZone, Utc};
 use chrono_tz::Tz;
 use fast_dav_rs::CalDavClient;
+use futures::future::join_all;
 use icalendar::{
     Calendar, CalendarDateTime, Component, DatePerhapsTime, Event, EventLike, Todo as IcalTodo,
 };
-use quick_xml::Reader;
-use quick_xml::events::Event as XmlEvent;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::{Duration, interval};
+
+/// Batch size for calendar-multiget requests
+const BATCH_SIZE: usize = 500;
 
 /// Manages synchronization with `CalDAV` server
 pub struct SyncManager {
@@ -25,9 +27,6 @@ pub struct SyncManager {
     cache: Arc<CacheManager>,
     data: Arc<RwLock<CalendarData>>,
     calendar_colors: Arc<RwLock<std::collections::HashMap<String, String>>>,
-    server_url: String,
-    username: String,
-    password: String,
 }
 
 impl SyncManager {
@@ -36,13 +35,7 @@ impl SyncManager {
     /// # Errors
     ///
     /// Returns an error if the cache cannot be loaded from disk.
-    pub fn new(
-        client: CalDavClient,
-        cache: CacheManager,
-        server_url: String,
-        username: String,
-        password: String,
-    ) -> Result<Self> {
+    pub fn new(client: CalDavClient, cache: CacheManager) -> Result<Self> {
         let data = cache.load()?.map_or_else(
             || {
                 info!("No cache found, starting fresh");
@@ -67,9 +60,6 @@ impl SyncManager {
             cache: Arc::new(cache),
             data,
             calendar_colors: Arc::new(RwLock::new(std::collections::HashMap::new())),
-            server_url,
-            username,
-            password,
         })
     }
 
@@ -105,6 +95,23 @@ impl SyncManager {
         let calendars = self.client.list_calendars(home).await?;
         debug!("Found {} calendars", calendars.len());
 
+        // Log sync tokens from calendar list (if provided by server)
+        for calendar in &calendars {
+            let name = calendar
+                .displayname
+                .as_ref()
+                .map_or("unnamed", |s| s.as_str());
+            debug!(
+                "Calendar '{}' has sync_token from list_calendars: {:?}",
+                name,
+                calendar.sync_token.as_ref().map(|t| if t.len() > 50 {
+                    format!("{}... ({} chars)", &t[..50], t.len())
+                } else {
+                    t.clone()
+                })
+            );
+        }
+
         // Check if server supports WebDAV sync
         let supports_sync = self.client.supports_webdav_sync().await.unwrap_or(false);
         if supports_sync {
@@ -116,82 +123,27 @@ impl SyncManager {
         // Track calendar URLs we see during this sync
         let mut active_calendar_urls = std::collections::HashSet::new();
 
-        // Process each calendar
+        // Store calendar colors first (quick, can be done sequentially)
         for calendar in &calendars {
-            let calendar_name = calendar
-                .displayname
-                .clone()
-                .unwrap_or_else(|| "Unnamed".to_string());
-            let calendar_url = calendar.href.clone();
-
-            // Track this calendar as active
+            let calendar_url = &calendar.href;
             active_calendar_urls.insert(calendar_url.clone());
 
-            // Store calendar color if available
             if let Some(color) = &calendar.color {
                 self.calendar_colors
                     .write()
                     .await
                     .insert(calendar_url.clone(), color.clone());
-                debug!("Calendar '{}' has color: {}", calendar_name, color);
-            } else {
-                // Try fetching color from Apple namespace if standard namespace didn't provide it
-                if let Ok(Some(apple_color)) = self.fetch_apple_calendar_color(&calendar_url).await
-                {
-                    self.calendar_colors
-                        .write()
-                        .await
-                        .insert(calendar_url.clone(), apple_color.clone());
-                    debug!(
-                        "Calendar '{}' has Apple calendar-color: {}",
-                        calendar_name, apple_color
-                    );
-                }
-            }
-
-            debug!("Syncing calendar: {}", calendar_name);
-
-            // Check if this calendar has been synced before and has a sync token
-            let (has_been_synced, has_sync_token) = {
-                let data = self.data.read().await;
-                let synced = data.events.iter().any(|e| e.calendar_url == calendar_url)
-                    || data.todos.iter().any(|t| t.calendar_url == calendar_url);
-                let token = data.sync_tokens.get(&calendar_url);
-                // Don't use incremental sync if token is "NO_SYNC"
-                let has_token = token.is_some() && token != Some(&"NO_SYNC".to_string());
-                (synced, has_token)
-            };
-
-            // Strategy:
-            // 1. First sync ever: Use full query (most reliable for initial data fetch)
-            // 2. Has sync token: Use sync_collection (incremental)
-            // 3. Has been synced but no token: Server doesn't support sync tokens, use full sync
-            let sync_result = if !has_been_synced {
-                debug!("First sync for {} - using full query", calendar_name);
-                self.sync_calendar_full(&calendar_url, &calendar_name).await
-            } else if supports_sync && has_sync_token {
-                debug!(
-                    "Using sync_collection for {} (subsequent sync)",
-                    calendar_name
-                );
-                self.sync_calendar_incremental(&calendar_url, &calendar_name)
-                    .await
-            } else {
-                debug!(
-                    "Using full sync for {} (no sync token support or not supported by server)",
-                    calendar_name
-                );
-                self.sync_calendar_full(&calendar_url, &calendar_name).await
-            };
-
-            // Log any errors but continue with other calendars
-            if let Err(e) = sync_result {
-                error!(
-                    "Failed to sync calendar {} at {}: {:?}",
-                    calendar_name, calendar_url, e
-                );
             }
         }
+
+        // Process all calendars concurrently
+        let sync_tasks: Vec<_> = calendars
+            .iter()
+            .map(|calendar| self.sync_single_calendar(calendar, supports_sync))
+            .collect();
+
+        // Execute all calendar syncs concurrently
+        join_all(sync_tasks).await;
 
         // Clean up events/todos from calendars that no longer exist
         let (removed_events, removed_todos) = {
@@ -252,232 +204,53 @@ impl SyncManager {
         Ok(())
     }
 
-    /// Fetch calendar color from Apple namespace (<http://apple.com/ns/ical/>)
-    ///
-    /// This is a fallback for servers (like iCloud) that provide calendar-color
-    /// in Apple's proprietary namespace instead of the standard `CalDAV` namespace.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the PROPFIND request fails
-    async fn fetch_apple_calendar_color(&self, calendar_url: &str) -> Result<Option<String>> {
-        // Construct absolute URL from the relative calendar path
-        let absolute_url =
-            if calendar_url.starts_with("http://") || calendar_url.starts_with("https://") {
-                calendar_url.to_string()
-            } else {
-                let base = self.server_url.trim_end_matches('/');
-                let path = calendar_url.trim_start_matches('/');
-                format!("{base}/{path}")
-            };
-
-        let propfind_body = r#"<?xml version="1.0" encoding="UTF-8"?>
-<d:propfind xmlns:d="DAV:" xmlns:apple="http://apple.com/ns/ical/">
-  <d:prop>
-    <apple:calendar-color/>
-  </d:prop>
-</d:propfind>"#;
-
-        let client = reqwest::Client::new();
-        let response = client
-            .request(reqwest::Method::from_bytes(b"PROPFIND")?, &absolute_url)
-            .header("Depth", "0")
-            .header("Content-Type", "application/xml; charset=utf-8")
-            .basic_auth(&self.username, Some(&self.password))
-            .body(propfind_body)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            debug!(
-                "Apple color PROPFIND returned non-success status: {}",
-                response.status()
-            );
-            return Ok(None);
-        }
-
-        let body = response.text().await?;
-
-        // Parse the XML to extract Apple calendar-color
-        let mut reader = Reader::from_str(&body);
-        reader.config_mut().trim_text(true);
-
-        let mut buf = Vec::new();
-        let mut in_apple_color = false;
-        let mut color_value = None;
-
-        loop {
-            match reader.read_event_into(&mut buf) {
-                Ok(XmlEvent::Start(ref e)) => {
-                    let name = e.name();
-                    let local_name_bytes = name.local_name();
-                    let local_name = String::from_utf8_lossy(local_name_bytes.as_ref()).to_string();
-
-                    if local_name == "calendar-color" {
-                        // Check if it's in Apple namespace by looking at the xmlns attribute
-                        // iCloud returns: <calendar-color xmlns="http://apple.com/ns/ical/">
-                        for attr in e.attributes().flatten() {
-                            let key = std::str::from_utf8(attr.key.as_ref()).unwrap_or("");
-                            let value = std::str::from_utf8(&attr.value).unwrap_or("");
-                            if key == "xmlns" && value == "http://apple.com/ns/ical/" {
-                                in_apple_color = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-                Ok(XmlEvent::Text(e)) => {
-                    if in_apple_color {
-                        color_value = Some(std::str::from_utf8(e.as_ref())?.to_string());
-                    }
-                }
-                Ok(XmlEvent::End(ref e)) => {
-                    let name = e.name();
-                    let local_name_bytes = name.local_name();
-                    let local_name = String::from_utf8_lossy(local_name_bytes.as_ref()).to_string();
-
-                    if local_name == "calendar-color" && in_apple_color {
-                        // We found the color, can break early
-                        break;
-                    }
-                }
-                Ok(XmlEvent::Eof) => break,
-                Err(e) => {
-                    debug!("Error parsing Apple color XML: {:?}", e);
-                    break;
-                }
-                _ => {}
-            }
-            buf.clear();
-        }
-
-        Ok(color_value)
-    }
-
-    /// Diagnostic function to check what calendar-color properties the server returns
-    ///
-    /// Makes a custom `PROPFIND` request with both standard `CalDAV` and Apple namespaces
-    /// to help debug calendar color issues.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the PROPFIND request fails
-    pub async fn diagnose_calendar_color(
+    /// Sync a single calendar with appropriate strategy
+    async fn sync_single_calendar(
         &self,
-        calendar_url: &str,
-        base_url: &str,
-        username: &str,
-        password: &str,
-    ) -> Result<()> {
-        info!("=== Calendar Color Diagnostic for {} ===", calendar_url);
+        calendar: &fast_dav_rs::CalendarInfo,
+        supports_sync: bool,
+    ) {
+        let calendar_name = calendar
+            .displayname
+            .clone()
+            .unwrap_or_else(|| "Unnamed".to_string());
+        let calendar_url = calendar.href.clone();
 
-        // Construct absolute URL from base and relative calendar path
-        let absolute_url =
-            if calendar_url.starts_with("http://") || calendar_url.starts_with("https://") {
-                calendar_url.to_string()
-            } else {
-                // Remove trailing slash from base_url and leading slash from calendar_url if present
-                let base = base_url.trim_end_matches('/');
-                let path = calendar_url.trim_start_matches('/');
-                format!("{base}/{path}")
-            };
+        debug!("Syncing calendar: {}", calendar_name);
 
-        info!("Absolute URL: {}", absolute_url);
-
-        // Build PROPFIND request body with both standard and Apple namespaces
-        let propfind_body = r#"<?xml version="1.0" encoding="UTF-8"?>
-<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:apple="http://apple.com/ns/ical/">
-  <d:prop>
-    <d:displayname/>
-    <c:calendar-color/>
-    <apple:calendar-color/>
-  </d:prop>
-</d:propfind>"#;
-
-        // Make the request
-        let client = reqwest::Client::new();
-        let response = client
-            .request(reqwest::Method::from_bytes(b"PROPFIND")?, &absolute_url)
-            .header("Depth", "0")
-            .header("Content-Type", "application/xml; charset=utf-8")
-            .basic_auth(username, Some(password))
-            .body(propfind_body)
-            .send()
-            .await?;
-
-        let status = response.status();
-        info!("Response status: {}", status);
-
-        let body = response.text().await?;
-        info!("Response body:\n{}", body);
-
-        // Parse the XML to extract color properties
-        let mut reader = Reader::from_str(&body);
-        reader.config_mut().trim_text(true);
-
-        let mut buf = Vec::new();
-        let mut in_caldav_color = false;
-        let mut in_apple_color = false;
-        let mut current_text = String::new();
-
-        loop {
-            match reader.read_event_into(&mut buf) {
-                Ok(XmlEvent::Start(ref e)) => {
-                    let name = e.name();
-                    let local_name_bytes = name.local_name();
-                    let local_name = String::from_utf8_lossy(local_name_bytes.as_ref()).to_string();
-
-                    if local_name == "calendar-color" {
-                        // Check namespace
-                        if let Some(ns) = name.prefix() {
-                            let ns_str = String::from_utf8_lossy(ns.as_ref()).to_string();
-                            if ns_str == "c" {
-                                in_caldav_color = true;
-                                info!("Found CalDAV calendar-color element");
-                            } else if ns_str == "apple" {
-                                in_apple_color = true;
-                                info!("Found Apple calendar-color element");
-                            }
-                        }
-                    }
-                }
-                Ok(XmlEvent::Text(e)) => {
-                    if in_caldav_color || in_apple_color {
-                        current_text = std::str::from_utf8(e.as_ref())?.to_string();
-                    }
-                }
-                Ok(XmlEvent::End(ref e)) => {
-                    let name = e.name();
-                    let local_name_bytes = name.local_name();
-                    let local_name = String::from_utf8_lossy(local_name_bytes.as_ref()).to_string();
-
-                    if local_name == "calendar-color" {
-                        if in_caldav_color {
-                            info!("CalDAV calendar-color value: '{}'", current_text);
-                            in_caldav_color = false;
-                        } else if in_apple_color {
-                            info!("Apple calendar-color value: '{}'", current_text);
-                            in_apple_color = false;
-                        }
-                        current_text.clear();
-                    }
-                }
-                Ok(XmlEvent::Eof) => break,
+        // Choose sync strategy
+        let sync_result = if supports_sync {
+            debug!(
+                "Using sync_collection for {} (subsequent sync)",
+                calendar_name
+            );
+            match self
+                .sync_calendar_incremental(&calendar_url, &calendar_name)
+                .await
+            {
+                Ok(()) => Ok(()),
                 Err(e) => {
                     warn!(
-                        "Error parsing XML at position {}: {:?}",
-                        reader.buffer_position(),
-                        e
+                        "Incremental sync failed for {}, falling back to time-range: {}",
+                        calendar_name, e
                     );
-                    break;
+                    self.sync_calendar_full(&calendar_url, &calendar_name).await
                 }
-                _ => {}
             }
-            buf.clear();
-        }
+        } else {
+            debug!(
+                "Using time-range query for {} (faster than full sync)",
+                calendar_name
+            );
+            self.sync_calendar_full(&calendar_url, &calendar_name).await
+        };
 
-        info!("=== End Calendar Color Diagnostic ===");
-        Ok(())
+        if let Err(e) = sync_result {
+            error!(
+                "Failed to sync calendar {} at {}: {:?}",
+                calendar_name, calendar_url, e
+            );
+        }
     }
 
     /// Perform incremental sync using `WebDAV` sync-collection
@@ -518,18 +291,21 @@ impl SyncManager {
         );
 
         // Perform sync-collection query
+        // Pass false for include_data - iCloud doesn't return data in sync-collection
+        // We'll fetch the data separately for changed items
+        // Set a limit - some servers (like iCloud) may require this to return sync tokens
         let sync_response = self
             .client
-            .sync_collection(calendar_url, sync_token.as_deref(), None, true)
+            .sync_collection(calendar_url, sync_token.as_deref(), Some(1000), false)
             .await?;
 
-        info!(
+        debug!(
             "sync_collection returned {} items for {}",
             sync_response.items.len(),
             calendar_name
         );
         debug!(
-            "sync_collection response details: sync_token={:?}, items_count={}",
+            "sync_collection response: sync_token={:?}, items_count={}",
             sync_response.sync_token,
             sync_response.items.len()
         );
@@ -538,43 +314,41 @@ impl SyncManager {
         let mut added_todos = 0;
         let mut deleted_count = 0;
 
-        // Process each changed item
-        for item in &sync_response.items {
-            debug!(
-                "Processing sync item: href={}, is_deleted={}, has_data={}",
-                item.href,
-                item.is_deleted,
-                item.calendar_data.is_some()
-            );
+        // Separate deleted items from changed items
+        let mut hrefs_to_fetch = Vec::new();
 
+        for item in &sync_response.items {
             if item.is_deleted {
                 deleted_count += self.process_deleted_item(&item.href).await;
-            } else if let Some(ical_data) = &item.calendar_data {
-                let (events, todos) = self
-                    .process_calendar_item(
-                        ical_data,
-                        &item.href,
-                        item.etag.as_ref(),
-                        calendar_name,
-                        calendar_url,
-                    )
-                    .await;
-                added_events += events;
-                added_todos += todos;
-            } else {
-                warn!(
-                    "Item {} has no calendar data - server did not include data in sync-collection response",
-                    item.href
-                );
+            } else if !item.href.ends_with('/') {
+                // Skip calendar collections, collect .ics files to fetch
+                hrefs_to_fetch.push(item.href.clone());
             }
+        }
+
+        if !hrefs_to_fetch.is_empty() {
+            let (events, todos) = self
+                .batch_fetch_calendar_items(calendar_url, calendar_name, &hrefs_to_fetch)
+                .await;
+            added_events += events;
+            added_todos += todos;
         }
 
         // Store new sync token
         if let Some(new_token) = &sync_response.sync_token {
-            info!(
-                "Storing new sync token for {}: {}",
-                calendar_name, new_token
-            );
+            // Check if token changed before logging
+            let token_changed = {
+                let data = self.data.read().await;
+                data.sync_tokens.get(calendar_url) != Some(new_token)
+            };
+
+            if token_changed {
+                info!(
+                    "Storing new sync token for {}: {}",
+                    calendar_name, new_token
+                );
+            }
+
             let mut data = self.data.write().await;
             data.sync_tokens
                 .insert(calendar_url.to_string(), new_token.clone());
@@ -597,6 +371,70 @@ impl SyncManager {
         );
 
         Ok(())
+    }
+
+    /// Batch fetch calendar items using calendar-multiget
+    ///
+    /// Returns (`events_count`, `todos_count`)
+    async fn batch_fetch_calendar_items(
+        &self,
+        calendar_url: &str,
+        calendar_name: &str,
+        hrefs: &[String],
+    ) -> (usize, usize) {
+        info!(
+            "Fetching {} changed items for {} in batches",
+            hrefs.len(),
+            calendar_name
+        );
+
+        let mut added_events = 0;
+        let mut added_todos = 0;
+
+        // Batch fetch items using calendar-multiget
+        for (batch_num, chunk) in hrefs.chunks(BATCH_SIZE).enumerate() {
+            debug!(
+                "Fetching batch {}/{} ({} items) for {}",
+                batch_num + 1,
+                hrefs.len().div_ceil(BATCH_SIZE),
+                chunk.len(),
+                calendar_name
+            );
+
+            match self
+                .client
+                .calendar_multiget(calendar_url, chunk, true)
+                .await
+            {
+                Ok(objects) => {
+                    for obj in objects {
+                        if let Some(ical_data) = obj.calendar_data {
+                            let (events, todos) = self
+                                .process_calendar_item(
+                                    &ical_data,
+                                    &obj.href,
+                                    obj.etag.as_ref(),
+                                    calendar_name,
+                                    calendar_url,
+                                )
+                                .await;
+                            added_events += events;
+                            added_todos += todos;
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to fetch batch {} for {}: {}",
+                        batch_num + 1,
+                        calendar_name,
+                        e
+                    );
+                }
+            }
+        }
+
+        (added_events, added_todos)
     }
 
     /// Perform full sync of a calendar
@@ -629,20 +467,6 @@ impl SyncManager {
         // Add new items
         data.events.extend(events);
         data.todos.extend(todos);
-
-        // Mark this calendar as synced by adding an empty token
-        // This signals that next sync should try sync_collection
-        // The empty string will be converted to None in sync_calendar_incremental
-        // If the server doesn't return a token, it will be marked with "NO_SYNC"
-        // Don't overwrite "NO_SYNC" marker - those calendars should always use full sync
-        if self.client.supports_webdav_sync().await.unwrap_or(false) {
-            let current_token = data.sync_tokens.get(calendar_url);
-            if current_token != Some(&"NO_SYNC".to_string()) {
-                data.sync_tokens
-                    .entry(calendar_url.to_string())
-                    .or_insert_with(String::new);
-            }
-        }
 
         drop(data);
 
@@ -724,23 +548,7 @@ impl SyncManager {
                             // Expand recurring events
                             let config = RecurrenceConfig::default();
 
-                            // Debug logging for Pay Period events
-                            if event.summary.contains("Pay") {
-                                info!(
-                                    "About to expand event '{}' with RRULE: {:?}",
-                                    event.summary, event.rrule
-                                );
-                            }
-
                             let instances = expand_recurring_event(&event, &config);
-
-                            if event.summary.contains("Pay") {
-                                info!(
-                                    "Expansion result for '{}': {} instances",
-                                    event.summary,
-                                    instances.len()
-                                );
-                            }
 
                             let instance_count = instances.len();
                             for instance in instances {

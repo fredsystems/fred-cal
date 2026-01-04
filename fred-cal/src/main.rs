@@ -38,7 +38,6 @@ async fn main() -> Result<()> {
     // Parse command line arguments
     let cli = Cli::parse_args();
     let port = cli.port;
-    let diagnose_colors = cli.diagnose_colors;
 
     // Load and validate credentials
     let credentials = cli.load_credentials()?;
@@ -58,64 +57,7 @@ async fn main() -> Result<()> {
     )?;
 
     // Create sync manager
-    let sync_manager = Arc::new(SyncManager::new(
-        client,
-        cache,
-        credentials.server_url.clone(),
-        credentials.username.clone(),
-        credentials.password.clone(),
-    )?);
-
-    // If diagnostic mode is enabled, run color diagnostics and exit
-    if diagnose_colors {
-        info!("Running calendar color diagnostics...");
-
-        // Create a new client for diagnostic purposes
-        let diag_client = CalDavClient::new(
-            &credentials.server_url,
-            Some(&credentials.username),
-            Some(&credentials.password),
-        )?;
-
-        // First, discover calendars
-        let principal = diag_client
-            .discover_current_user_principal()
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("No principal returned"))?;
-        let homes = diag_client.discover_calendar_home_set(&principal).await?;
-        let home = homes
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("Missing calendar-home-set"))?;
-        let calendars = diag_client.list_calendars(home).await?;
-
-        info!("Found {} calendars to diagnose", calendars.len());
-
-        for calendar in &calendars {
-            let calendar_name = calendar
-                .displayname
-                .clone()
-                .unwrap_or_else(|| "Unnamed".to_string());
-            info!("\n=== Checking calendar: {} ===", calendar_name);
-            info!("URL: {}", calendar.href);
-            info!("Color from fast-dav-rs: {:?}", calendar.color);
-
-            // Run custom PROPFIND diagnostic
-            if let Err(e) = sync_manager
-                .diagnose_calendar_color(
-                    &calendar.href,
-                    &credentials.server_url,
-                    &credentials.username,
-                    &credentials.password,
-                )
-                .await
-            {
-                error!("Diagnostic failed for {}: {:?}", calendar_name, e);
-            }
-        }
-
-        info!("\n=== Diagnostic complete - exiting ===");
-        return Ok(());
-    }
+    let sync_manager = Arc::new(SyncManager::new(client, cache)?);
 
     // Perform initial sync
     info!("Performing initial sync...");

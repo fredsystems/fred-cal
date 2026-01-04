@@ -374,13 +374,7 @@ async fn test_parse_icalendar_data() -> Result<()> {
     )?;
 
     // Create sync manager and perform sync
-    let sync_manager = Arc::new(SyncManager::new(
-        client,
-        cache,
-        mock_server.uri(),
-        "testuser@example.com".to_string(),
-        "password123".to_string(),
-    )?);
+    let sync_manager = Arc::new(SyncManager::new(client, cache)?);
     sync_manager.sync().await?;
 
     // Verify the parsed data
@@ -514,13 +508,7 @@ async fn test_apple_calendar_color_fetch() -> Result<()> {
         Some("password123"),
     )?;
 
-    let sync_manager = Arc::new(SyncManager::new(
-        client,
-        cache,
-        mock_server.uri(),
-        "testuser@example.com".to_string(),
-        "password123".to_string(),
-    )?);
+    let sync_manager = Arc::new(SyncManager::new(client, cache)?);
 
     sync_manager.sync().await?;
 
@@ -591,7 +579,7 @@ async fn test_sync_with_calendar_colors_in_events() -> Result<()> {
         .and(path("/calendars/user/"))
         .respond_with(ResponseTemplate::new(207).set_body_string(
             r#"<?xml version="1.0" encoding="UTF-8"?>
-<d:multistatus xmlns:d="DAV:">
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:apple="http://apple.com/ns/ical/">
   <d:response>
     <d:href>/calendars/user/work/</d:href>
     <d:propstat>
@@ -599,33 +587,14 @@ async fn test_sync_with_calendar_colors_in_events() -> Result<()> {
         <d:displayname>Work</d:displayname>
         <d:resourcetype>
           <d:collection/>
-          <c:calendar xmlns:c="urn:ietf:params:xml:ns:caldav"/>
+          <c:calendar/>
         </d:resourcetype>
+        <apple:calendar-color>#0000FFFF</apple:calendar-color>
       </d:prop>
       <d:status>HTTP/1.1 200 OK</d:status>
     </d:propstat>
   </d:response>
 </d:multistatus>"#,
-        ))
-        .mount(&mock_server)
-        .await;
-
-    // Mock Apple calendar color PROPFIND
-    Mock::given(method("PROPFIND"))
-        .and(path("/calendars/user/work/"))
-        .respond_with(ResponseTemplate::new(207).set_body_string(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
-<multistatus xmlns="DAV:">
-  <response xmlns="DAV:">
-    <href>/calendars/user/work/</href>
-    <propstat>
-      <prop>
-        <calendar-color xmlns="http://apple.com/ns/ical/">#0000FFFF</calendar-color>
-      </prop>
-      <status>HTTP/1.1 200 OK</status>
-    </propstat>
-  </response>
-</multistatus>"#,
         ))
         .mount(&mock_server)
         .await;
@@ -675,13 +644,7 @@ END:VCALENDAR</c:calendar-data>
         Some("password123"),
     )?;
 
-    let sync_manager = Arc::new(SyncManager::new(
-        client,
-        cache,
-        mock_server.uri(),
-        "testuser@example.com".to_string(),
-        "password123".to_string(),
-    )?);
+    let sync_manager = Arc::new(SyncManager::new(client, cache)?);
 
     sync_manager.sync().await?;
 
@@ -696,6 +659,144 @@ END:VCALENDAR</c:calendar-data>
     assert_eq!(event.calendar_name, "Work");
     // Calendar color should be populated from Apple namespace
     assert_eq!(event.calendar_color, Some("#0000FFFF".to_string()));
+
+    Ok(())
+}
+
+/// Test standard CalDAV calendar-color property (non-Apple namespace)
+#[tokio::test]
+async fn test_standard_caldav_calendar_color() -> Result<()> {
+    init_crypto();
+
+    let mock_server = MockServer::start().await;
+
+    // Mock the current-user-principal discovery
+    Mock::given(method("PROPFIND"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(207).set_body_string(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>/</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:current-user-principal>
+          <d:href>/principals/user/</d:href>
+        </d:current-user-principal>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#,
+        ))
+        .mount(&mock_server)
+        .await;
+
+    // Mock the calendar-home-set discovery
+    Mock::given(method("PROPFIND"))
+        .and(path("/principals/user/"))
+        .respond_with(ResponseTemplate::new(207).set_body_string(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:response>
+    <d:href>/principals/user/</d:href>
+    <d:propstat>
+      <d:prop>
+        <c:calendar-home-set>
+          <d:href>/calendars/user/</d:href>
+        </c:calendar-home-set>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#,
+        ))
+        .mount(&mock_server)
+        .await;
+
+    // Mock the calendar list with standard CalDAV calendar-color
+    Mock::given(method("PROPFIND"))
+        .and(path("/calendars/user/"))
+        .respond_with(ResponseTemplate::new(207).set_body_string(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:ical="http://apple.com/ns/ical/">
+  <d:response>
+    <d:href>/calendars/user/standard/</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:displayname>Standard Calendar</d:displayname>
+        <d:resourcetype>
+          <d:collection/>
+          <c:calendar/>
+        </d:resourcetype>
+        <ical:calendar-color>#00FF00FF</ical:calendar-color>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#,
+        ))
+        .mount(&mock_server)
+        .await;
+
+    // Mock REPORT query with an event
+    Mock::given(method("REPORT"))
+        .and(path("/calendars/user/standard/"))
+        .respond_with(ResponseTemplate::new(207).set_body_string(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:response>
+    <d:href>/calendars/user/standard/event1.ics</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:getetag>"standard123"</d:getetag>
+        <c:calendar-data>BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//Test//EN
+BEGIN:VEVENT
+UID:standard-event-1
+DTSTART:20260104T140000Z
+DTEND:20260104T150000Z
+SUMMARY:Standard Color Event
+END:VEVENT
+END:VCALENDAR</c:calendar-data>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#,
+        ))
+        .mount(&mock_server)
+        .await;
+
+    use fred_cal::cache::CacheManager;
+    use fred_cal::sync::SyncManager;
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir()?;
+    let cache = CacheManager::new_with_path(temp_dir.path().to_path_buf())?;
+
+    let client = CalDavClient::new(
+        &mock_server.uri(),
+        Some("testuser@example.com"),
+        Some("password123"),
+    )?;
+
+    let sync_manager = Arc::new(SyncManager::new(client, cache)?);
+
+    sync_manager.sync().await?;
+
+    let data = sync_manager.data();
+    let calendar_data = data.read().await;
+
+    // Verify we got the event with standard CalDAV color
+    assert_eq!(calendar_data.events.len(), 1);
+    let event = &calendar_data.events[0];
+    assert_eq!(event.uid, "standard-event-1");
+    assert_eq!(event.summary, "Standard Color Event");
+    assert_eq!(event.calendar_name, "Standard Calendar");
+    // Standard CalDAV color should be populated
+    assert_eq!(event.calendar_color, Some("#00FF00FF".to_string()));
 
     Ok(())
 }
@@ -806,13 +907,7 @@ async fn test_apple_color_fetch_failure() -> Result<()> {
         Some("password123"),
     )?;
 
-    let sync_manager = Arc::new(SyncManager::new(
-        client,
-        cache,
-        mock_server.uri(),
-        "testuser@example.com".to_string(),
-        "password123".to_string(),
-    )?);
+    let sync_manager = Arc::new(SyncManager::new(client, cache)?);
 
     // Sync should succeed even if Apple color fetch fails
     sync_manager.sync().await?;
@@ -988,13 +1083,7 @@ END:VCALENDAR</c:calendar-data>
         Some("password123"),
     )?;
 
-    let sync_manager = Arc::new(SyncManager::new(
-        client,
-        cache,
-        mock_server.uri(),
-        "testuser@example.com".to_string(),
-        "password123".to_string(),
-    )?);
+    let sync_manager = Arc::new(SyncManager::new(client, cache)?);
 
     // First sync with both calendars
     sync_manager.sync().await?;
