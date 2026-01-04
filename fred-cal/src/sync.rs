@@ -1508,5 +1508,357 @@ mod tests {
         assert_eq!(parsed.etag, Some("etag-abc".to_string()));
     }
 
+    #[test]
+    fn test_parse_datetime_with_timezone_tz() {
+        let naive =
+            NaiveDateTime::parse_from_str("2026-01-15 14:30:00", "%Y-%m-%d %H:%M:%S").unwrap();
+        let tz: Tz = "America/New_York".parse().unwrap();
+        let _dt = tz.from_local_datetime(&naive).unwrap();
+        let cal_dt = CalendarDateTime::WithTimezone {
+            date_time: naive,
+            tzid: "America/New_York".to_string(),
+        };
+        let dpt = DatePerhapsTime::DateTime(cal_dt);
+
+        let result = parse_datetime(Some(&dpt));
+        assert!(result.is_some());
+
+        let parsed = result.unwrap();
+        assert_eq!(parsed.year(), 2026);
+        assert_eq!(parsed.month(), 1);
+        assert_eq!(parsed.day(), 15);
+    }
+
+    #[test]
+    fn test_parse_gmt_offset_positive() {
+        use chrono::FixedOffset;
+        assert_eq!(
+            parse_gmt_offset("GMT+0500"),
+            FixedOffset::east_opt(5 * 3600)
+        );
+        assert_eq!(
+            parse_gmt_offset("GMT+0530"),
+            FixedOffset::east_opt(5 * 3600 + 30 * 60)
+        );
+        assert_eq!(parse_gmt_offset("GMT+0000"), FixedOffset::east_opt(0));
+        assert_eq!(parse_gmt_offset("GMT"), FixedOffset::east_opt(0));
+    }
+
+    #[test]
+    fn test_parse_gmt_offset_negative() {
+        use chrono::FixedOffset;
+        assert_eq!(
+            parse_gmt_offset("GMT-0500"),
+            FixedOffset::east_opt(-5 * 3600)
+        );
+        assert_eq!(
+            parse_gmt_offset("GMT-0800"),
+            FixedOffset::east_opt(-8 * 3600)
+        );
+    }
+
+    #[test]
+    fn test_parse_gmt_offset_invalid() {
+        assert_eq!(parse_gmt_offset("invalid"), None);
+        assert_eq!(parse_gmt_offset("GMT+99"), None);
+        assert_eq!(parse_gmt_offset("+0500"), None); // Missing GMT prefix
+    }
+
+    #[test]
+    fn test_parse_event_no_summary() {
+        let start_time = Utc.with_ymd_and_hms(2026, 1, 10, 10, 0, 0).unwrap();
+        let end_time = Utc.with_ymd_and_hms(2026, 1, 10, 11, 0, 0).unwrap();
+
+        let event = Event::new()
+            .uid("no-summary")
+            .starts(start_time)
+            .ends(end_time)
+            .done();
+
+        let result = parse_event(&event, "Test", "/test", None, None);
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        assert_eq!(parsed.summary, "Untitled Event");
+    }
+
+    #[test]
+    fn test_parse_todo_no_summary() {
+        use icalendar::Todo as IcalTodo;
+
+        let todo = IcalTodo::new().uid("no-summary").done();
+
+        let result = parse_todo(&todo, "Tasks", "/tasks", None);
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        assert_eq!(parsed.summary, "Untitled Task");
+    }
+
+    #[test]
+    fn test_parse_event_with_description() {
+        let start_time = Utc.with_ymd_and_hms(2026, 2, 1, 9, 0, 0).unwrap();
+        let end_time = Utc.with_ymd_and_hms(2026, 2, 1, 10, 0, 0).unwrap();
+
+        let event = Event::new()
+            .uid("with-desc")
+            .summary("Test Event")
+            .description("This is a test description")
+            .starts(start_time)
+            .ends(end_time)
+            .done();
+
+        let result = parse_event(&event, "Calendar", "/cal", None, None);
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        assert_eq!(
+            parsed.description,
+            Some("This is a test description".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_event_with_location() {
+        let start_time = Utc.with_ymd_and_hms(2026, 3, 1, 14, 0, 0).unwrap();
+        let end_time = Utc.with_ymd_and_hms(2026, 3, 1, 15, 0, 0).unwrap();
+
+        let event = Event::new()
+            .uid("with-loc")
+            .summary("Meeting")
+            .location("Conference Room A")
+            .starts(start_time)
+            .ends(end_time)
+            .done();
+
+        let result = parse_event(&event, "Work", "/work", None, None);
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        assert_eq!(parsed.location, Some("Conference Room A".to_string()));
+    }
+
+    #[test]
+    fn test_parse_todo_with_description() {
+        use icalendar::Todo as IcalTodo;
+
+        let todo = IcalTodo::new()
+            .uid("todo-desc")
+            .summary("Task")
+            .description("Task description")
+            .done();
+
+        let result = parse_todo(&todo, "Tasks", "/tasks", None);
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        assert_eq!(parsed.description, Some("Task description".to_string()));
+    }
+
+    #[test]
+    fn test_parse_todo_cancelled_status() {
+        use icalendar::Todo as IcalTodo;
+
+        let todo = IcalTodo::new()
+            .uid("cancelled")
+            .summary("Cancelled Task")
+            .status(icalendar::TodoStatus::Cancelled)
+            .done();
+
+        let result = parse_todo(&todo, "Tasks", "/tasks", None);
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        assert_eq!(parsed.status, "Cancelled");
+    }
+
+    #[test]
+    fn test_parse_todo_in_process_status() {
+        use icalendar::Todo as IcalTodo;
+
+        let todo = IcalTodo::new()
+            .uid("in-progress")
+            .summary("Active Task")
+            .status(icalendar::TodoStatus::InProcess)
+            .done();
+
+        let result = parse_todo(&todo, "Tasks", "/tasks", None);
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        assert_eq!(parsed.status, "InProcess");
+    }
+
+    #[test]
+    fn test_parse_event_tentative_status() {
+        let start_time = Utc.with_ymd_and_hms(2026, 4, 1, 10, 0, 0).unwrap();
+        let end_time = Utc.with_ymd_and_hms(2026, 4, 1, 11, 0, 0).unwrap();
+
+        let event = Event::new()
+            .uid("tentative")
+            .summary("Maybe Event")
+            .starts(start_time)
+            .ends(end_time)
+            .status(icalendar::EventStatus::Tentative)
+            .done();
+
+        let result = parse_event(&event, "Cal", "/cal", None, None);
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        assert_eq!(parsed.status, Some("Tentative".to_string()));
+    }
+
+    #[test]
+    fn test_parse_event_cancelled_status() {
+        let start_time = Utc.with_ymd_and_hms(2026, 5, 1, 10, 0, 0).unwrap();
+        let end_time = Utc.with_ymd_and_hms(2026, 5, 1, 11, 0, 0).unwrap();
+
+        let event = Event::new()
+            .uid("cancelled")
+            .summary("Cancelled Event")
+            .starts(start_time)
+            .ends(end_time)
+            .status(icalendar::EventStatus::Cancelled)
+            .done();
+
+        let result = parse_event(&event, "Cal", "/cal", None, None);
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        assert_eq!(parsed.status, Some("Cancelled".to_string()));
+    }
+
+    #[test]
+    fn test_parse_todo_needs_action_status() {
+        use icalendar::Todo as IcalTodo;
+
+        let todo = IcalTodo::new()
+            .uid("needs-action")
+            .summary("New Task")
+            .status(icalendar::TodoStatus::NeedsAction)
+            .done();
+
+        let result = parse_todo(&todo, "Tasks", "/tasks", None);
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        assert_eq!(parsed.status, "NeedsAction");
+    }
+
+    #[test]
+    fn test_batch_size_constant() {
+        assert_eq!(BATCH_SIZE, 500);
+    }
+
+    #[test]
+    fn test_parse_event_all_day_with_date_only() {
+        // All-day events typically use Date type
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 6, 15).unwrap();
+        let dpt_start = DatePerhapsTime::Date(date);
+        let dpt_end = DatePerhapsTime::Date(date + chrono::Days::new(1));
+
+        let event = Event::new()
+            .uid("all-day-date")
+            .summary("All Day Event")
+            .starts(dpt_start)
+            .ends(dpt_end)
+            .done();
+
+        let result = parse_event(&event, "Cal", "/cal", None, None);
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        assert!(parsed.all_day);
+        assert_eq!(parsed.start.day(), 15);
+    }
+
+    #[test]
+    fn test_parse_todo_no_dates() {
+        use icalendar::Todo as IcalTodo;
+
+        let todo = IcalTodo::new()
+            .uid("no-dates")
+            .summary("Task without dates")
+            .done();
+
+        let result = parse_todo(&todo, "Tasks", "/tasks", Some("etag-xyz"));
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        assert!(parsed.due.is_none());
+        assert!(parsed.start.is_none());
+        assert!(parsed.completed.is_none());
+        assert_eq!(parsed.etag, Some("etag-xyz".to_string()));
+    }
+
+    #[test]
+    fn test_parse_event_no_etag() {
+        let start_time = Utc.with_ymd_and_hms(2026, 7, 1, 10, 0, 0).unwrap();
+        let end_time = Utc.with_ymd_and_hms(2026, 7, 1, 11, 0, 0).unwrap();
+
+        let event = Event::new()
+            .uid("no-etag")
+            .summary("Event")
+            .starts(start_time)
+            .ends(end_time)
+            .done();
+
+        let result = parse_event(&event, "Cal", "/cal", None, None);
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        assert!(parsed.etag.is_none());
+    }
+
+    #[test]
+    fn test_parse_todo_priority_zero() {
+        use icalendar::Todo as IcalTodo;
+
+        let todo = IcalTodo::new()
+            .uid("priority-zero")
+            .summary("Undefined Priority")
+            .priority(0)
+            .done();
+
+        let result = parse_todo(&todo, "Tasks", "/tasks", None);
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        // Priority 0 means undefined, so it should be None
+        assert_eq!(parsed.priority, None);
+    }
+
+    #[test]
+    fn test_parse_todo_percent_zero() {
+        use icalendar::Todo as IcalTodo;
+
+        let todo = IcalTodo::new()
+            .uid("percent-zero")
+            .summary("Not Started")
+            .percent_complete(0)
+            .done();
+
+        let result = parse_todo(&todo, "Tasks", "/tasks", None);
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        assert_eq!(parsed.percent_complete, Some(0));
+    }
+
+    #[test]
+    fn test_parse_datetime_date_becomes_midnight_utc() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 8, 20).unwrap();
+        let dpt = DatePerhapsTime::Date(date);
+
+        let result = parse_datetime(Some(&dpt));
+        assert!(result.is_some());
+
+        let parsed = result.unwrap();
+        assert_eq!(parsed.hour(), 0);
+        assert_eq!(parsed.minute(), 0);
+        assert_eq!(parsed.second(), 0);
+    }
+
     // Full integration tests for sync manager are in the integration test suite
 }
