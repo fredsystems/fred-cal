@@ -6,7 +6,7 @@
 use anyhow::Result;
 use fast_dav_rs::CalDavClient;
 use std::io::Write;
-use std::sync::Once;
+use std::sync::{Arc, Once};
 use tempfile::NamedTempFile;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
@@ -275,14 +275,10 @@ async fn test_authentication_failure() -> Result<()> {
 async fn test_parse_icalendar_data() -> Result<()> {
     init_crypto();
 
-    // Skip this test inside Nix builds
-    if std::env::var_os("NIX_BUILD_TOP").is_some() {
-        return Ok(());
-    }
-
     use fred_cal::cache::CacheManager;
     use fred_cal::sync::SyncManager;
     use std::sync::Arc;
+    use tempfile::tempdir;
 
     let mock_server = MockServer::start().await;
 
@@ -367,8 +363,8 @@ async fn test_parse_icalendar_data() -> Result<()> {
         .await;
 
     // Create a temporary cache
-    let cache = CacheManager::new()?;
-    cache.clear()?;
+    let temp_dir = tempdir()?;
+    let cache = CacheManager::new_with_path(temp_dir.path().to_path_buf())?;
 
     // Create CalDAV client
     let client = CalDavClient::new(
@@ -395,6 +391,667 @@ async fn test_parse_icalendar_data() -> Result<()> {
     // The mock returns empty results, which is fine - we're testing the workflow
     assert_eq!(calendar_data.events.len(), 0);
     assert_eq!(calendar_data.todos.len(), 0);
+
+    Ok(())
+}
+
+/// Test Apple calendar color fetching with mock server
+#[tokio::test]
+async fn test_apple_calendar_color_fetch() -> Result<()> {
+    init_crypto();
+
+    let mock_server = MockServer::start().await;
+
+    // Mock the current-user-principal discovery
+    Mock::given(method("PROPFIND"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(207).set_body_string(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:apple="http://apple.com/ns/ical/">
+  <d:response>
+    <d:href>/</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:current-user-principal>
+          <d:href>/principals/user/</d:href>
+        </d:current-user-principal>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#,
+        ))
+        .mount(&mock_server)
+        .await;
+
+    // Mock the calendar-home-set discovery
+    Mock::given(method("PROPFIND"))
+        .and(path("/principals/user/"))
+        .respond_with(ResponseTemplate::new(207).set_body_string(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:response>
+    <d:href>/principals/user/</d:href>
+    <d:propstat>
+      <d:prop>
+        <c:calendar-home-set>
+          <d:href>/calendars/user/</d:href>
+        </c:calendar-home-set>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#,
+        ))
+        .mount(&mock_server)
+        .await;
+
+    // Mock the calendar list with Apple calendar-color
+    Mock::given(method("PROPFIND"))
+        .and(path("/calendars/user/"))
+        .respond_with(ResponseTemplate::new(207).set_body_string(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:apple="http://apple.com/ns/ical/">
+  <d:response>
+    <d:href>/calendars/user/personal/</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:displayname>Personal</d:displayname>
+        <d:resourcetype>
+          <d:collection/>
+          <c:calendar/>
+        </d:resourcetype>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#,
+        ))
+        .mount(&mock_server)
+        .await;
+
+    // Mock the Apple calendar-color PROPFIND request
+    Mock::given(method("PROPFIND"))
+        .and(path("/calendars/user/personal/"))
+        .respond_with(ResponseTemplate::new(207).set_body_string(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:apple="http://apple.com/ns/ical/">
+  <d:response>
+    <d:href>/calendars/user/personal/</d:href>
+    <d:propstat>
+      <d:prop>
+        <apple:calendar-color>#FF5733FF</apple:calendar-color>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#,
+        ))
+        .mount(&mock_server)
+        .await;
+
+    // Mock REPORT query
+    Mock::given(method("REPORT"))
+        .and(path("/calendars/user/personal/"))
+        .respond_with(ResponseTemplate::new(207).set_body_string(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+</d:multistatus>"#,
+        ))
+        .mount(&mock_server)
+        .await;
+
+    use fred_cal::cache::CacheManager;
+    use fred_cal::sync::SyncManager;
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir()?;
+    let cache = CacheManager::new_with_path(temp_dir.path().to_path_buf())?;
+
+    let client = CalDavClient::new(
+        &mock_server.uri(),
+        Some("testuser@example.com"),
+        Some("password123"),
+    )?;
+
+    let sync_manager = Arc::new(SyncManager::new(
+        client,
+        cache,
+        mock_server.uri(),
+        "testuser@example.com".to_string(),
+        "password123".to_string(),
+    )?);
+
+    sync_manager.sync().await?;
+
+    // Note: We can't directly test the internal calendar_colors map,
+    // but this test verifies the workflow doesn't error
+    let data = sync_manager.data();
+    let calendar_data = data.read().await;
+
+    // Verify sync completed
+    assert!(calendar_data.last_sync > chrono::Utc::now() - chrono::Duration::minutes(1));
+
+    Ok(())
+}
+
+/// Test sync with events containing calendar colors
+#[tokio::test]
+async fn test_sync_with_calendar_colors_in_events() -> Result<()> {
+    init_crypto();
+
+    let mock_server = MockServer::start().await;
+
+    // Mock the current-user-principal discovery
+    Mock::given(method("PROPFIND"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(207).set_body_string(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>/</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:current-user-principal>
+          <d:href>/principals/user/</d:href>
+        </d:current-user-principal>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#,
+        ))
+        .mount(&mock_server)
+        .await;
+
+    // Mock calendar-home-set discovery
+    Mock::given(method("PROPFIND"))
+        .and(path("/principals/user/"))
+        .respond_with(ResponseTemplate::new(207).set_body_string(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>/principals/user/</d:href>
+    <d:propstat>
+      <d:prop>
+        <c:calendar-home-set xmlns:c="urn:ietf:params:xml:ns:caldav">
+          <d:href>/calendars/user/</d:href>
+        </c:calendar-home-set>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#,
+        ))
+        .mount(&mock_server)
+        .await;
+
+    // Mock list calendars with Apple color
+    Mock::given(method("PROPFIND"))
+        .and(path("/calendars/user/"))
+        .respond_with(ResponseTemplate::new(207).set_body_string(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>/calendars/user/work/</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:displayname>Work</d:displayname>
+        <d:resourcetype>
+          <d:collection/>
+          <c:calendar xmlns:c="urn:ietf:params:xml:ns:caldav"/>
+        </d:resourcetype>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#,
+        ))
+        .mount(&mock_server)
+        .await;
+
+    // Mock Apple calendar color PROPFIND
+    Mock::given(method("PROPFIND"))
+        .and(path("/calendars/user/work/"))
+        .respond_with(ResponseTemplate::new(207).set_body_string(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<multistatus xmlns="DAV:">
+  <response xmlns="DAV:">
+    <href>/calendars/user/work/</href>
+    <propstat>
+      <prop>
+        <calendar-color xmlns="http://apple.com/ns/ical/">#0000FFFF</calendar-color>
+      </prop>
+      <status>HTTP/1.1 200 OK</status>
+    </propstat>
+  </response>
+</multistatus>"#,
+        ))
+        .mount(&mock_server)
+        .await;
+
+    // Mock calendar query with an event
+    Mock::given(method("REPORT"))
+        .respond_with(ResponseTemplate::new(207).set_body_string(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:response>
+    <d:href>/calendars/user/work/event1.ics</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:getetag>"abc123"</d:getetag>
+        <c:calendar-data>BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//Test//EN
+BEGIN:VEVENT
+UID:test-event-1
+DTSTART:20260104T100000Z
+DTEND:20260104T110000Z
+SUMMARY:Test Meeting
+DESCRIPTION:A test event
+LOCATION:Conference Room
+STATUS:CONFIRMED
+END:VEVENT
+END:VCALENDAR</c:calendar-data>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#,
+        ))
+        .mount(&mock_server)
+        .await;
+
+    use fred_cal::cache::CacheManager;
+    use fred_cal::sync::SyncManager;
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir()?;
+    let cache = CacheManager::new_with_path(temp_dir.path().to_path_buf())?;
+
+    let client = CalDavClient::new(
+        &mock_server.uri(),
+        Some("testuser@example.com"),
+        Some("password123"),
+    )?;
+
+    let sync_manager = Arc::new(SyncManager::new(
+        client,
+        cache,
+        mock_server.uri(),
+        "testuser@example.com".to_string(),
+        "password123".to_string(),
+    )?);
+
+    sync_manager.sync().await?;
+
+    let data = sync_manager.data();
+    let calendar_data = data.read().await;
+
+    // Verify we got the event
+    assert_eq!(calendar_data.events.len(), 1);
+    let event = &calendar_data.events[0];
+    assert_eq!(event.uid, "test-event-1");
+    assert_eq!(event.summary, "Test Meeting");
+    assert_eq!(event.calendar_name, "Work");
+    // Calendar color should be populated from Apple namespace
+    assert_eq!(event.calendar_color, Some("#0000FFFF".to_string()));
+
+    Ok(())
+}
+
+/// Test error handling when Apple color PROPFIND fails
+#[tokio::test]
+async fn test_apple_color_fetch_failure() -> Result<()> {
+    init_crypto();
+
+    let mock_server = MockServer::start().await;
+
+    // Mock the current-user-principal discovery
+    Mock::given(method("PROPFIND"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(207).set_body_string(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>/</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:current-user-principal>
+          <d:href>/principals/user/</d:href>
+        </d:current-user-principal>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#,
+        ))
+        .mount(&mock_server)
+        .await;
+
+    // Mock the calendar-home-set discovery
+    Mock::given(method("PROPFIND"))
+        .and(path("/principals/user/"))
+        .respond_with(ResponseTemplate::new(207).set_body_string(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:response>
+    <d:href>/principals/user/</d:href>
+    <d:propstat>
+      <d:prop>
+        <c:calendar-home-set>
+          <d:href>/calendars/user/</d:href>
+        </c:calendar-home-set>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#,
+        ))
+        .mount(&mock_server)
+        .await;
+
+    // Mock the calendar list without color
+    Mock::given(method("PROPFIND"))
+        .and(path("/calendars/user/"))
+        .respond_with(ResponseTemplate::new(207).set_body_string(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:response>
+    <d:href>/calendars/user/personal/</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:displayname>Personal</d:displayname>
+        <d:resourcetype>
+          <d:collection/>
+          <c:calendar/>
+        </d:resourcetype>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#,
+        ))
+        .mount(&mock_server)
+        .await;
+
+    // Mock the Apple calendar-color PROPFIND request to return 404
+    Mock::given(method("PROPFIND"))
+        .and(path("/calendars/user/personal/"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&mock_server)
+        .await;
+
+    // Mock REPORT query
+    Mock::given(method("REPORT"))
+        .and(path("/calendars/user/personal/"))
+        .respond_with(ResponseTemplate::new(207).set_body_string(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+</d:multistatus>"#,
+        ))
+        .mount(&mock_server)
+        .await;
+
+    use fred_cal::cache::CacheManager;
+    use fred_cal::sync::SyncManager;
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir()?;
+    let cache = CacheManager::new_with_path(temp_dir.path().to_path_buf())?;
+
+    let client = CalDavClient::new(
+        &mock_server.uri(),
+        Some("testuser@example.com"),
+        Some("password123"),
+    )?;
+
+    let sync_manager = Arc::new(SyncManager::new(
+        client,
+        cache,
+        mock_server.uri(),
+        "testuser@example.com".to_string(),
+        "password123".to_string(),
+    )?);
+
+    // Sync should succeed even if Apple color fetch fails
+    sync_manager.sync().await?;
+
+    let data = sync_manager.data();
+    let calendar_data = data.read().await;
+
+    // Verify sync completed successfully despite color fetch failure
+    assert!(calendar_data.last_sync > chrono::Utc::now() - chrono::Duration::minutes(1));
+
+    Ok(())
+}
+
+/// Test that events from deleted calendars are cleaned up during sync
+#[tokio::test]
+async fn test_deleted_calendar_cleanup() -> Result<()> {
+    init_crypto();
+
+    use fred_cal::cache::CacheManager;
+    use fred_cal::sync::SyncManager;
+    use tempfile::tempdir;
+
+    let mock_server = MockServer::start().await;
+
+    // Mock the current-user-principal discovery
+    Mock::given(method("PROPFIND"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(207).set_body_string(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>/</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:current-user-principal>
+          <d:href>/principals/user/</d:href>
+        </d:current-user-principal>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#,
+        ))
+        .mount(&mock_server)
+        .await;
+
+    // Mock calendar-home-set discovery
+    Mock::given(method("PROPFIND"))
+        .and(path("/principals/user/"))
+        .respond_with(ResponseTemplate::new(207).set_body_string(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:response>
+    <d:href>/principals/user/</d:href>
+    <d:propstat>
+      <d:prop>
+        <c:calendar-home-set>
+          <d:href>/calendars/user/</d:href>
+        </c:calendar-home-set>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#,
+        ))
+        .mount(&mock_server)
+        .await;
+
+    // First sync: Mock list with TWO calendars
+    Mock::given(method("PROPFIND"))
+        .and(path("/calendars/user/"))
+        .respond_with(ResponseTemplate::new(207).set_body_string(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:response>
+    <d:href>/calendars/user/personal/</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:displayname>Personal</d:displayname>
+        <d:resourcetype>
+          <d:collection/>
+          <c:calendar/>
+        </d:resourcetype>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/calendars/user/work/</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:displayname>Work</d:displayname>
+        <d:resourcetype>
+          <d:collection/>
+          <c:calendar/>
+        </d:resourcetype>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#,
+        ))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    // Mock REPORT for personal calendar with one event
+    Mock::given(method("REPORT"))
+        .and(path("/calendars/user/personal/"))
+        .respond_with(ResponseTemplate::new(207).set_body_string(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:response>
+    <d:href>/calendars/user/personal/event1.ics</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:getetag>"abc123"</d:getetag>
+        <c:calendar-data>BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//Test//EN
+BEGIN:VEVENT
+UID:personal-event-1
+DTSTART:20260105T100000Z
+DTEND:20260105T110000Z
+SUMMARY:Personal Event
+END:VEVENT
+END:VCALENDAR</c:calendar-data>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#,
+        ))
+        .mount(&mock_server)
+        .await;
+
+    // Mock REPORT for work calendar with one event
+    Mock::given(method("REPORT"))
+        .and(path("/calendars/user/work/"))
+        .respond_with(ResponseTemplate::new(207).set_body_string(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:response>
+    <d:href>/calendars/user/work/event1.ics</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:getetag>"def456"</d:getetag>
+        <c:calendar-data>BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Test//Test//EN
+BEGIN:VEVENT
+UID:work-event-1
+DTSTART:20260106T140000Z
+DTEND:20260106T150000Z
+SUMMARY:Work Meeting
+END:VEVENT
+END:VCALENDAR</c:calendar-data>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#,
+        ))
+        .mount(&mock_server)
+        .await;
+
+    let temp_dir = tempdir()?;
+    let cache = CacheManager::new_with_path(temp_dir.path().to_path_buf())?;
+
+    let client = CalDavClient::new(
+        &mock_server.uri(),
+        Some("testuser@example.com"),
+        Some("password123"),
+    )?;
+
+    let sync_manager = Arc::new(SyncManager::new(
+        client,
+        cache,
+        mock_server.uri(),
+        "testuser@example.com".to_string(),
+        "password123".to_string(),
+    )?);
+
+    // First sync with both calendars
+    sync_manager.sync().await?;
+
+    {
+        let data = sync_manager.data();
+        let calendar_data = data.read().await;
+        assert_eq!(calendar_data.events.len(), 2);
+        assert!(
+            calendar_data
+                .events
+                .iter()
+                .any(|e| e.uid == "personal-event-1")
+        );
+        assert!(calendar_data.events.iter().any(|e| e.uid == "work-event-1"));
+    }
+
+    // Add a new mock for second sync with only one calendar (work calendar deleted)
+    Mock::given(method("PROPFIND"))
+        .and(path("/calendars/user/"))
+        .respond_with(ResponseTemplate::new(207).set_body_string(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:response>
+    <d:href>/calendars/user/personal/</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:displayname>Personal</d:displayname>
+        <d:resourcetype>
+          <d:collection/>
+          <c:calendar/>
+        </d:resourcetype>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>"#,
+        ))
+        .mount(&mock_server)
+        .await;
+
+    // Second sync - work calendar is now gone
+    sync_manager.sync().await?;
+
+    {
+        let data = sync_manager.data();
+        let calendar_data = data.read().await;
+        // Should only have 1 event now (work calendar events removed)
+        assert_eq!(calendar_data.events.len(), 1);
+        assert!(
+            calendar_data
+                .events
+                .iter()
+                .any(|e| e.uid == "personal-event-1")
+        );
+        assert!(!calendar_data.events.iter().any(|e| e.uid == "work-event-1"));
+    }
 
     Ok(())
 }

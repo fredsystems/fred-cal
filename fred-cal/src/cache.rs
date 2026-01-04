@@ -34,6 +34,20 @@ impl CacheManager {
         Ok(Self { cache_dir })
     }
 
+    /// Create a new cache manager with a custom directory (for testing)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cache directory cannot be created or accessed.
+    pub fn new_with_path(cache_dir: PathBuf) -> Result<Self> {
+        // Ensure the cache directory exists
+        if !cache_dir.exists() {
+            fs::create_dir_all(&cache_dir).context("Failed to create cache directory")?;
+        }
+
+        Ok(Self { cache_dir })
+    }
+
     /// Get the XDG-compliant cache directory for the application
     fn get_cache_directory() -> Result<PathBuf> {
         let data_dir = dirs::data_dir()
@@ -144,7 +158,6 @@ mod tests {
     use super::*;
     use crate::models::{CalendarEvent, Todo};
     use chrono::{TimeZone, Utc};
-    use temp_env::with_var;
     use tempfile::TempDir;
     use tempfile::tempdir;
 
@@ -159,18 +172,10 @@ mod tests {
 
     #[test]
     fn test_cache_manager_new() -> Result<()> {
-        // Skip this test inside Nix builds
-        if std::env::var_os("NIX_BUILD_TOP").is_some() {
-            return Ok(());
-        }
-
-        let tmp = tempdir()?;
-
-        with_var("XDG_CACHE_HOME", Some(tmp.path()), || {
-            let cache = CacheManager::new()?;
-            assert!(cache.cache_directory().exists());
-            Ok(())
-        })
+        let temp_dir = tempdir()?;
+        let cache = CacheManager::new_with_path(temp_dir.path().to_path_buf())?;
+        assert!(cache.cache_directory().exists());
+        Ok(())
     }
 
     #[test]

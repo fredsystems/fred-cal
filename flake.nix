@@ -104,6 +104,7 @@
                 cargo-deny
                 cargo-machete
                 typos
+                cargo-llvm-cov
               ]
               ++ (chk.passthru.devPackages or [ ])
               ++ chk.enabledPackages;
