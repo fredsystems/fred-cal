@@ -11,7 +11,7 @@ use axum::{
     response::{IntoResponse, Json, Response},
     routing::get,
 };
-use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, Duration, Local, NaiveDate, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -63,6 +63,7 @@ pub fn create_router(data: Arc<RwLock<CalendarData>>) -> Router {
         .route("/api/get_today_calendars", get(get_today_calendars))
         .route("/api/get_today_todos", get(get_today_todos))
         .route("/api/get_date_range/{range}", get(get_date_range))
+        .route("/api/debug/events", get(debug_events))
         .route("/api/health", get(health_check))
         .with_state(state)
         .layer(
@@ -178,46 +179,153 @@ async fn get_date_range(
     }))
 }
 
-/// Get the date range for "today" (midnight to midnight in UTC)
+/// Debug endpoint to show detailed event information with timezone data
+async fn debug_events(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let data = state.data.read().await;
+    let now_utc = Utc::now();
+    let now_local = Local::now();
+
+    let events_debug: Vec<serde_json::Value> = data
+        .events
+        .iter()
+        .map(|event| {
+            serde_json::json!({
+                "uid": event.uid,
+                "summary": event.summary,
+                "start_utc": event.start.to_rfc3339(),
+                "end_utc": event.end.to_rfc3339(),
+                "all_day": event.all_day,
+                "calendar": event.calendar_name,
+            })
+        })
+        .collect();
+
+    let todos_debug: Vec<serde_json::Value> = data
+        .todos
+        .iter()
+        .map(|todo| {
+            serde_json::json!({
+                "uid": todo.uid,
+                "summary": todo.summary,
+                "due_utc": todo.due.map(|d| d.to_rfc3339()),
+                "start_utc": todo.start.map(|s| s.to_rfc3339()),
+                "status": todo.status,
+                "calendar": todo.calendar_name,
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "current_time_utc": now_utc.to_rfc3339(),
+        "current_time_local": now_local.to_rfc3339(),
+        "local_timezone_offset": now_local.offset().to_string(),
+        "total_events": events_debug.len(),
+        "total_todos": todos_debug.len(),
+        "events": events_debug,
+        "todos": todos_debug,
+        "last_sync": data.last_sync.to_rfc3339(),
+    })))
+}
+
+/// Get the date range for "today" (midnight to midnight in local timezone, converted to UTC)
+///
+/// This ensures that "today" is based on the user's local timezone, not UTC.
+/// For example, if it's 11pm PST (7am UTC next day), this will still return
+/// events for "today" in PST, not tomorrow's UTC date.
 fn get_today_range() -> (DateTime<Utc>, DateTime<Utc>) {
-    let now = Utc::now();
+    let now = Local::now();
     // SAFETY: 0:0:0 is always a valid time
     let start = now
         .date_naive()
         .and_hms_opt(0, 0, 0)
-        .unwrap_or_else(|| now.naive_utc());
+        .unwrap_or_else(|| now.naive_local());
     let end = start + Duration::days(1);
 
-    (Utc.from_utc_datetime(&start), Utc.from_utc_datetime(&end))
+    // Convert local times to UTC for querying
+    // SAFETY: start and end are valid naive datetimes constructed from current date
+    // This should never fail in practice, but we handle the Option to satisfy clippy
+    let start_utc = Local
+        .from_local_datetime(&start)
+        .earliest()
+        .unwrap_or_else(|| {
+            // This should never happen with valid date/time values
+            panic!("Failed to convert start time to local timezone")
+        })
+        .with_timezone(&Utc);
+    let end_utc = Local
+        .from_local_datetime(&end)
+        .earliest()
+        .unwrap_or_else(|| {
+            // This should never happen with valid date/time values
+            panic!("Failed to convert end time to local timezone")
+        })
+        .with_timezone(&Utc);
+
+    (start_utc, end_utc)
 }
 
 /// Parse a date range string into start and end `DateTime`s
+///
+/// All date ranges are calculated based on the local timezone and then converted to UTC.
 fn parse_date_range(range: &str) -> Result<(DateTime<Utc>, DateTime<Utc>), ApiError> {
-    let now = Utc::now();
+    let now = Local::now();
     // SAFETY: 0:0:0 is always a valid time
     let today_start = now
         .date_naive()
         .and_hms_opt(0, 0, 0)
-        .unwrap_or_else(|| now.naive_utc());
+        .unwrap_or_else(|| now.naive_local());
 
     match range {
         "today" => {
-            let start = Utc.from_utc_datetime(&today_start);
+            let start = Local
+                .from_local_datetime(&today_start)
+                .earliest()
+                .ok_or_else(|| {
+                    ApiError::InvalidDateRange(
+                        "Failed to convert today to local timezone".to_string(),
+                    )
+                })?
+                .with_timezone(&Utc);
             let end = start + Duration::days(1);
             Ok((start, end))
         }
         "tomorrow" => {
-            let start = Utc.from_utc_datetime(&today_start) + Duration::days(1);
+            let tomorrow_start = today_start + Duration::days(1);
+            let start = Local
+                .from_local_datetime(&tomorrow_start)
+                .earliest()
+                .ok_or_else(|| {
+                    ApiError::InvalidDateRange(
+                        "Failed to convert tomorrow to local timezone".to_string(),
+                    )
+                })?
+                .with_timezone(&Utc);
             let end = start + Duration::days(1);
             Ok((start, end))
         }
         "week" => {
-            let start = Utc.from_utc_datetime(&today_start);
+            let start = Local
+                .from_local_datetime(&today_start)
+                .earliest()
+                .ok_or_else(|| {
+                    ApiError::InvalidDateRange(
+                        "Failed to convert week start to local timezone".to_string(),
+                    )
+                })?
+                .with_timezone(&Utc);
             let end = start + Duration::days(7);
             Ok((start, end))
         }
         "month" => {
-            let start = Utc.from_utc_datetime(&today_start);
+            let start = Local
+                .from_local_datetime(&today_start)
+                .earliest()
+                .ok_or_else(|| {
+                    ApiError::InvalidDateRange(
+                        "Failed to convert month start to local timezone".to_string(),
+                    )
+                })?
+                .with_timezone(&Utc);
             let end = start + Duration::days(30);
             Ok((start, end))
         }
@@ -249,6 +357,8 @@ fn parse_date_range(range: &str) -> Result<(DateTime<Utc>, DateTime<Utc>), ApiEr
 }
 
 /// Parse a single date string (YYYY-MM-DD format)
+///
+/// Dates are interpreted as midnight in the local timezone, then converted to UTC.
 fn parse_single_date(date_str: &str) -> Result<DateTime<Utc>, ApiError> {
     let date = NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
         .map_err(|_| ApiError::InvalidDateRange(format!("Invalid date format: {date_str}")))?;
@@ -257,13 +367,22 @@ fn parse_single_date(date_str: &str) -> Result<DateTime<Utc>, ApiError> {
         .and_hms_opt(0, 0, 0)
         .ok_or_else(|| ApiError::InvalidDateRange("Invalid time".to_string()))?;
 
-    Ok(Utc.from_utc_datetime(&datetime))
+    // Interpret as local time and convert to UTC
+    let local_dt = Local
+        .from_local_datetime(&datetime)
+        .earliest()
+        .ok_or_else(|| {
+            ApiError::InvalidDateRange("Failed to convert date to local timezone".to_string())
+        })?;
+    Ok(local_dt.with_timezone(&Utc))
 }
 
 /// Parse a relative date like "+3d" or "-2d"
+///
+/// Relative dates are calculated from the current local time.
 fn parse_relative_date(
     range_str: &str,
-    base: DateTime<Utc>,
+    base: DateTime<Local>,
 ) -> Result<(DateTime<Utc>, DateTime<Utc>), ApiError> {
     let is_negative = range_str.starts_with('-');
     let num_str = &range_str[1..range_str.len() - 1];
@@ -289,7 +408,8 @@ fn parse_relative_date(
     };
 
     let end = start + Duration::days(1);
-    Ok((start, end))
+    // Convert to UTC
+    Ok((start.with_timezone(&Utc), end.with_timezone(&Utc)))
 }
 
 /// API error type
@@ -314,7 +434,7 @@ impl IntoResponse for ApiError {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use chrono::{Datelike, TimeZone, Utc};
+    use chrono::{Datelike, TimeZone};
 
     #[test]
     fn test_get_today_range() {
@@ -391,7 +511,7 @@ mod tests {
 
     #[test]
     fn test_parse_relative_date_positive() {
-        let base_opt = Utc.with_ymd_and_hms(2026, 1, 5, 12, 0, 0).single();
+        let base_opt = Local.with_ymd_and_hms(2026, 1, 5, 12, 0, 0).single();
         assert!(base_opt.is_some());
         let base = base_opt.unwrap();
         let result = parse_relative_date("+3d", base);
@@ -402,7 +522,7 @@ mod tests {
 
     #[test]
     fn test_parse_relative_date_negative() {
-        let base_opt = Utc.with_ymd_and_hms(2026, 1, 5, 12, 0, 0).single();
+        let base_opt = Local.with_ymd_and_hms(2026, 1, 5, 12, 0, 0).single();
         assert!(base_opt.is_some());
         let base = base_opt.unwrap();
         let result = parse_relative_date("-2d", base);
@@ -413,7 +533,7 @@ mod tests {
 
     #[test]
     fn test_parse_relative_date_weeks() {
-        let base_opt = Utc.with_ymd_and_hms(2026, 1, 5, 12, 0, 0).single();
+        let base_opt = Local.with_ymd_and_hms(2026, 1, 5, 12, 0, 0).single();
         assert!(base_opt.is_some());
         let base = base_opt.unwrap();
         let result = parse_relative_date("+1w", base);
