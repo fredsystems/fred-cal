@@ -7,6 +7,7 @@ clap = { workspace = true, features = ["derive", "env"] }
 dirs.workspace = true
 fast-dav-rs.workspace = true
 icalendar.workspace = true
+rrule.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["full"] }

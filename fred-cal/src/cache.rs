@@ -68,12 +68,6 @@ impl CacheManager {
         let data: CalendarData =
             serde_json::from_str(&contents).context("Failed to parse cache file")?;
 
-        info!(
-            "Loaded cache with {} events and {} todos",
-            data.events.len(),
-            data.todos.len()
-        );
-
         Ok(Some(data))
     }
 

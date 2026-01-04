@@ -5,6 +5,7 @@
 
 use crate::cache::CacheManager;
 use crate::models::{CalendarData, CalendarEvent, Todo};
+use crate::recurrence::{RecurrenceConfig, expand_recurring_event};
 use anyhow::Result;
 use chrono::{DateTime, Local, TimeZone, Utc};
 use chrono_tz::Tz;
@@ -348,9 +349,36 @@ impl SyncManager {
                         etag.map(String::as_str),
                     ) {
                         Ok(event) => {
+                            // Remove old instances of this event (by UID)
                             data.events.retain(|e| e.uid != event.uid);
-                            data.events.push(event);
-                            events_added += 1;
+
+                            // Expand recurring events
+                            let config = RecurrenceConfig::default();
+
+                            // Debug logging for Pay Period events
+                            if event.summary.contains("Pay") {
+                                info!(
+                                    "About to expand event '{}' with RRULE: {:?}",
+                                    event.summary, event.rrule
+                                );
+                            }
+
+                            let instances = expand_recurring_event(&event, &config);
+
+                            if event.summary.contains("Pay") {
+                                info!(
+                                    "Expansion result for '{}': {} instances",
+                                    event.summary,
+                                    instances.len()
+                                );
+                            }
+
+                            let instance_count = instances.len();
+                            for instance in instances {
+                                data.events.push(instance);
+                            }
+
+                            events_added += instance_count;
                         }
                         Err(e) => warn!("Failed to parse event: {}", e),
                     }
@@ -418,7 +446,14 @@ impl SyncManager {
                                         calendar_url,
                                         etag.as_deref(),
                                     ) {
-                                        Ok(event) => events.push(event),
+                                        Ok(event) => {
+                                            // Expand recurring events
+                                            let config = RecurrenceConfig::default();
+                                            let instances = expand_recurring_event(&event, &config);
+                                            for instance in instances {
+                                                events.push(instance);
+                                            }
+                                        }
                                         Err(e) => {
                                             warn!("Failed to parse event: {}", e);
                                         }
@@ -507,14 +542,11 @@ fn parse_event(
 
     // Start time (required)
     let start_opt = event.get_start();
-    debug!("Raw event start time for '{}': {:?}", summary, start_opt);
     let start = parse_datetime(start_opt.as_ref())
         .ok_or_else(|| anyhow::anyhow!("Event missing start time"))?;
 
     // End time (use start + 1 hour if not specified)
-    let end_opt = event.get_end();
-    debug!("Raw event end time for '{}': {:?}", summary, end_opt);
-    let end = end_opt.map_or_else(
+    let end = event.get_end().map_or_else(
         || start + chrono::Duration::hours(1),
         |end_time| {
             parse_datetime(Some(&end_time)).unwrap_or_else(|| start + chrono::Duration::hours(1))
@@ -529,11 +561,6 @@ fn parse_event(
 
     // Status
     let status = event.get_status().map(|s| format!("{s:?}"));
-
-    info!(
-        "Parsed event: '{}' | Start: {} UTC | End: {} UTC | All-day: {} | Calendar: {}",
-        summary, start, end, all_day, calendar_name
-    );
 
     Ok(CalendarEvent {
         uid,
@@ -571,14 +598,10 @@ fn parse_todo(
     let description = todo.get_description().map(String::from);
 
     // Due date
-    let due_opt = todo.get_due();
-    debug!("Raw todo due time for '{}': {:?}", summary, due_opt);
-    let due = due_opt.and_then(|d| parse_datetime(Some(&d)));
+    let due = todo.get_due().and_then(|d| parse_datetime(Some(&d)));
 
     // Start date
-    let start_opt = todo.get_start();
-    debug!("Raw todo start time for '{}': {:?}", summary, start_opt);
-    let start = start_opt.and_then(|s| parse_datetime(Some(&s)));
+    let start = todo.get_start().and_then(|s| parse_datetime(Some(&s)));
 
     // Completed date
     let completed = todo.get_completed();
@@ -605,11 +628,6 @@ fn parse_todo(
     let status = todo
         .get_status()
         .map_or_else(|| "NEEDS-ACTION".to_string(), |s| format!("{s:?}"));
-
-    info!(
-        "Parsed todo: '{}' | Due: {:?} UTC | Start: {:?} UTC | Status: {} | Calendar: {}",
-        summary, due, start, status, calendar_name
-    );
 
     Ok(Todo {
         uid,
@@ -665,6 +683,15 @@ fn parse_datetime(date_time: Option<&DatePerhapsTime>) -> Option<DateTime<Utc>> 
                     date_time, tzid, result
                 );
                 Some(result)
+            } else if let Some(offset) = parse_gmt_offset(tzid) {
+                // Try parsing GMT offset format (e.g., GMT-0700, GMT+0530)
+                let dt_with_offset = offset.from_local_datetime(date_time).earliest()?;
+                let result = dt_with_offset.with_timezone(&Utc);
+                debug!(
+                    "Parsed datetime with GMT offset: {} {} -> {} UTC",
+                    date_time, tzid, result
+                );
+                Some(result)
             } else {
                 // If timezone parsing fails, log a warning and treat as UTC
                 warn!("Failed to parse timezone '{}', treating as UTC", tzid);
@@ -684,6 +711,37 @@ fn parse_datetime(date_time: Option<&DatePerhapsTime>) -> Option<DateTime<Utc>> 
             Some(result)
         }
     }
+}
+
+/// Parse GMT offset format timezone (e.g., GMT-0700, GMT+0530)
+/// Returns a `FixedOffset` if successful
+fn parse_gmt_offset(tzid: &str) -> Option<chrono::FixedOffset> {
+    // Check for GMT+/-HHMM format
+    if let Some(offset_str) = tzid.strip_prefix("GMT") {
+        if offset_str.is_empty() {
+            // GMT with no offset is UTC (offset 0)
+            return chrono::FixedOffset::east_opt(0);
+        }
+
+        // Parse sign
+        let (sign, rest) = if let Some(rest) = offset_str.strip_prefix('+') {
+            (1, rest)
+        } else if let Some(rest) = offset_str.strip_prefix('-') {
+            (-1, rest)
+        } else {
+            return None;
+        };
+
+        // Parse HHMM
+        if rest.len() == 4 {
+            let hours: i32 = rest[0..2].parse().ok()?;
+            let minutes: i32 = rest[2..4].parse().ok()?;
+            let total_seconds = sign * (hours * 3600 + minutes * 60);
+            return chrono::FixedOffset::east_opt(total_seconds);
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -902,6 +960,31 @@ mod tests {
         assert_eq!(parsed.completed, Some(completed_time));
         assert_eq!(parsed.percent_complete, Some(100));
         assert_eq!(parsed.etag, Some("etag-456".to_string()));
+    }
+
+    #[test]
+    fn test_parse_gmt_offset() {
+        // Test GMT-0700 (Mountain Time)
+        let offset = parse_gmt_offset("GMT-0700");
+        assert!(offset.is_some());
+        assert_eq!(offset.unwrap().local_minus_utc(), -7 * 3600);
+
+        // Test GMT+0530 (India)
+        let offset = parse_gmt_offset("GMT+0530");
+        assert!(offset.is_some());
+        assert_eq!(offset.unwrap().local_minus_utc(), 5 * 3600 + 30 * 60);
+
+        // Test GMT (UTC)
+        let offset = parse_gmt_offset("GMT");
+        assert!(offset.is_some());
+        assert_eq!(offset.unwrap().local_minus_utc(), 0);
+
+        // Test invalid format
+        let offset = parse_gmt_offset("America/Denver");
+        assert!(offset.is_none());
+
+        let offset = parse_gmt_offset("GMT-07");
+        assert!(offset.is_none());
     }
 
     #[test]
