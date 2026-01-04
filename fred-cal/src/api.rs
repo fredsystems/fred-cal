@@ -519,6 +519,7 @@ mod tests {
             calendar_url: "/calendar/test".to_string(),
             calendar_color: Some("#FF0000".to_string()),
             rrule: None,
+            exdates: Vec::new(),
             status: None,
             etag: None,
         });

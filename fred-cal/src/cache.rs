@@ -195,6 +195,7 @@ mod tests {
             calendar_color: None,
             all_day: false,
             rrule: None,
+            exdates: Vec::new(),
             status: None,
             etag: None,
         });
@@ -338,18 +339,22 @@ mod tests {
         let mut data1 = CalendarData::new();
         data1.events.push(CalendarEvent {
             uid: "event-1".to_string(),
-            summary: "Event 1".to_string(),
+            summary: "Event".to_string(),
             description: None,
-            location: None,
-            start: Utc.with_ymd_and_hms(2026, 1, 1, 10, 0, 0).single().unwrap(),
-            end: Utc.with_ymd_and_hms(2026, 1, 1, 11, 0, 0).single().unwrap(),
-            calendar_name: "Cal1".to_string(),
-            calendar_url: "/cal1".to_string(),
+            location: Some("Office".to_string()),
+            start: Utc.with_ymd_and_hms(2026, 2, 10, 9, 0, 0).single().unwrap(),
+            end: Utc
+                .with_ymd_and_hms(2026, 2, 10, 10, 0, 0)
+                .single()
+                .unwrap(),
+            calendar_name: "Work".to_string(),
+            calendar_url: "/work".to_string(),
             calendar_color: Some("#FF0000".to_string()),
             all_day: false,
-            rrule: None,
+            rrule: Some("FREQ=DAILY".to_string()),
+            exdates: Vec::new(),
             status: Some("CONFIRMED".to_string()),
-            etag: Some("etag1".to_string()),
+            etag: Some("event-etag".to_string()),
         });
         cache.save(&data1)?;
 
@@ -416,6 +421,7 @@ mod tests {
             calendar_color: None,
             all_day: false,
             rrule: Some("FREQ=DAILY".to_string()),
+            exdates: Vec::new(),
             status: None,
             etag: None,
         });
@@ -521,7 +527,7 @@ mod tests {
                 .single()
                 .unwrap(),
             end: Utc
-                .with_ymd_and_hms(2026, 2, 15, 15, 30, 0)
+                .with_ymd_and_hms(2026, 2, 15, 16, 0, 0)
                 .single()
                 .unwrap(),
             calendar_name: "Work Calendar".to_string(),
@@ -529,8 +535,9 @@ mod tests {
             calendar_color: Some("#0000FF".to_string()),
             all_day: false,
             rrule: Some("FREQ=WEEKLY;BYDAY=MO".to_string()),
-            status: Some("TENTATIVE".to_string()),
-            etag: Some("etag-12345".to_string()),
+            exdates: Vec::new(),
+            status: Some("CONFIRMED".to_string()),
+            etag: Some("full-etag-123".to_string()),
         });
 
         cache.save(&data)?;
@@ -542,8 +549,8 @@ mod tests {
         assert_eq!(event.description, Some("Full description".to_string()));
         assert_eq!(event.location, Some("Conference Room A".to_string()));
         assert_eq!(event.calendar_color, Some("#0000FF".to_string()));
-        assert_eq!(event.status, Some("TENTATIVE".to_string()));
-        assert_eq!(event.etag, Some("etag-12345".to_string()));
+        assert_eq!(event.status, Some("CONFIRMED".to_string()));
+        assert_eq!(event.etag, Some("full-etag-123".to_string()));
         assert_eq!(event.rrule, Some("FREQ=WEEKLY;BYDAY=MO".to_string()));
 
         Ok(())
@@ -622,11 +629,12 @@ mod tests {
             location: None,
             start: Utc.with_ymd_and_hms(2026, 1, 1, 10, 0, 0).single().unwrap(),
             end: Utc.with_ymd_and_hms(2026, 1, 1, 11, 0, 0).single().unwrap(),
-            calendar_name: "Cal".to_string(),
-            calendar_url: "/cal".to_string(),
+            calendar_name: "Test".to_string(),
+            calendar_url: "/test".to_string(),
             calendar_color: None,
             all_day: false,
             rrule: None,
+            exdates: Vec::new(),
             status: None,
             etag: None,
         });
