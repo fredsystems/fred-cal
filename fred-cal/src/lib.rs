@@ -21,4 +21,5 @@ pub mod api;
 pub mod cache;
 pub mod cli;
 pub mod models;
+pub mod recurrence;
 pub mod sync;

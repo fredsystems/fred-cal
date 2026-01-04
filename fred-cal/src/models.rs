@@ -342,4 +342,118 @@ mod tests {
         assert_eq!(incomplete.len(), 1);
         assert_eq!(incomplete[0].uid, "1");
     }
+
+    #[test]
+    fn test_all_day_event_overlap() {
+        let mut data = CalendarData::new();
+
+        // All-day event from Jan 2-4 (stored as Jan 2 00:00 to Jan 4 00:00 UTC)
+        let all_day_event = CalendarEvent {
+            uid: "all-day-1".to_string(),
+            summary: "Multi-day Event".to_string(),
+            description: None,
+            location: None,
+            start: Utc
+                .with_ymd_and_hms(2026, 1, 2, 0, 0, 0)
+                .single()
+                .expect("valid datetime"),
+            end: Utc
+                .with_ymd_and_hms(2026, 1, 4, 0, 0, 0)
+                .single()
+                .expect("valid datetime"),
+            calendar_name: "Test".to_string(),
+            calendar_url: "/test".to_string(),
+            all_day: true,
+            rrule: None,
+            status: None,
+            etag: None,
+        };
+
+        data.events.push(all_day_event);
+
+        // Query for Jan 3 in Mountain Time (UTC-7): 07:00 UTC Jan 3 to 07:00 UTC Jan 4
+        let start = Utc
+            .with_ymd_and_hms(2026, 1, 3, 7, 0, 0)
+            .single()
+            .expect("valid datetime");
+        let end = Utc
+            .with_ymd_and_hms(2026, 1, 4, 7, 0, 0)
+            .single()
+            .expect("valid datetime");
+
+        let filtered_events = data.events_in_range(start, end);
+
+        // Should find the all-day event even though it neither starts nor ends on Jan 3
+        assert_eq!(filtered_events.len(), 1);
+        assert_eq!(filtered_events[0].uid, "all-day-1");
+        assert!(filtered_events[0].all_day);
+    }
+
+    #[test]
+    fn test_all_day_event_edge_cases() {
+        let mut data = CalendarData::new();
+
+        // Single-day all-day event on Jan 3
+        let single_day = CalendarEvent {
+            uid: "single-day".to_string(),
+            summary: "Single Day".to_string(),
+            description: None,
+            location: None,
+            start: Utc
+                .with_ymd_and_hms(2026, 1, 3, 0, 0, 0)
+                .single()
+                .expect("valid datetime"),
+            end: Utc
+                .with_ymd_and_hms(2026, 1, 4, 0, 0, 0)
+                .single()
+                .expect("valid datetime"),
+            calendar_name: "Test".to_string(),
+            calendar_url: "/test".to_string(),
+            all_day: true,
+            rrule: None,
+            status: None,
+            etag: None,
+        };
+
+        // Event that ends at midnight on query start (should not overlap)
+        let ends_at_midnight = CalendarEvent {
+            uid: "ends-midnight".to_string(),
+            summary: "Ends at Midnight".to_string(),
+            description: None,
+            location: None,
+            start: Utc
+                .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+                .single()
+                .expect("valid datetime"),
+            end: Utc
+                .with_ymd_and_hms(2026, 1, 3, 7, 0, 0)
+                .single()
+                .expect("valid datetime"),
+            calendar_name: "Test".to_string(),
+            calendar_url: "/test".to_string(),
+            all_day: true,
+            rrule: None,
+            status: None,
+            etag: None,
+        };
+
+        data.events.push(single_day);
+        data.events.push(ends_at_midnight);
+
+        // Query for Jan 3 Mountain Time
+        let start = Utc
+            .with_ymd_and_hms(2026, 1, 3, 7, 0, 0)
+            .single()
+            .expect("valid datetime");
+        let end = Utc
+            .with_ymd_and_hms(2026, 1, 4, 7, 0, 0)
+            .single()
+            .expect("valid datetime");
+
+        let filtered_events = data.events_in_range(start, end);
+
+        // Should only find the single-day event
+        assert_eq!(filtered_events.len(), 1);
+        assert_eq!(filtered_events[0].uid, "single-day");
+    }
 }

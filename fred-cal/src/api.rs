@@ -196,6 +196,7 @@ async fn debug_events(State(state): State<AppState>) -> Result<Json<serde_json::
                 "end_utc": event.end.to_rfc3339(),
                 "all_day": event.all_day,
                 "calendar": event.calendar_name,
+                "rrule": event.rrule,
             })
         })
         .collect();
