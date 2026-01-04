@@ -481,7 +481,66 @@ async fn trigger_sync(State(state): State<AppState>) -> Response {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::models::{CalendarEvent, Todo};
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode as HttpStatusCode};
     use chrono::{Datelike, TimeZone};
+    use tower::ServiceExt; // for `oneshot` - comes from axum's tower dependency
+
+    fn create_test_data() -> CalendarData {
+        let mut data = CalendarData::new();
+        data.last_sync = Utc::now();
+
+        // Add a test event for today
+        let now = Local::now();
+        let today_start = now.date_naive().and_hms_opt(10, 0, 0).unwrap();
+        let today_end = now.date_naive().and_hms_opt(11, 0, 0).unwrap();
+
+        let start_utc = Local
+            .from_local_datetime(&today_start)
+            .earliest()
+            .unwrap()
+            .with_timezone(&Utc);
+        let end_utc = Local
+            .from_local_datetime(&today_end)
+            .earliest()
+            .unwrap()
+            .with_timezone(&Utc);
+
+        data.events.push(CalendarEvent {
+            uid: "test-event-1".to_string(),
+            summary: "Test Event".to_string(),
+            description: None,
+            location: None,
+            start: start_utc,
+            end: end_utc,
+            all_day: false,
+            calendar_name: "Test Calendar".to_string(),
+            calendar_url: "/calendar/test".to_string(),
+            calendar_color: Some("#FF0000".to_string()),
+            rrule: None,
+            status: None,
+            etag: None,
+        });
+
+        // Add a test todo for today
+        data.todos.push(Todo {
+            uid: "test-todo-1".to_string(),
+            summary: "Test Todo".to_string(),
+            description: None,
+            due: Some(start_utc),
+            start: None,
+            status: "NEEDS-ACTION".to_string(),
+            completed: None,
+            priority: None,
+            percent_complete: None,
+            calendar_name: "Test Calendar".to_string(),
+            calendar_url: "/calendar/test".to_string(),
+            etag: None,
+        });
+
+        data
+    }
 
     #[test]
     fn test_get_today_range() {
@@ -530,6 +589,18 @@ mod tests {
         assert_eq!(date.date_naive().year(), 2026);
         assert_eq!(date.date_naive().month(), 1);
         assert_eq!(date.date_naive().day(), 5);
+    }
+
+    #[test]
+    fn test_parse_single_date_invalid() {
+        let result = parse_single_date("invalid-date");
+        assert!(result.is_err());
+        match result {
+            Err(ApiError::InvalidDateRange(msg)) => {
+                assert!(msg.contains("Invalid date format"));
+            }
+            _ => panic!("Expected InvalidDateRange error"),
+        }
     }
 
     #[test]
@@ -590,10 +661,388 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_relative_date_invalid_unit() {
+        let base = Local::now();
+        let result = parse_relative_date("+3x", base);
+        assert!(result.is_err());
+        match result {
+            Err(ApiError::InvalidDateRange(msg)) => {
+                assert!(msg.contains("Invalid unit"));
+            }
+            _ => panic!("Expected InvalidDateRange error"),
+        }
+    }
+
+    #[test]
+    fn test_parse_relative_date_invalid_number() {
+        let base = Local::now();
+        let result = parse_relative_date("+abcd", base);
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_parse_invalid_date_range() {
         assert!(parse_date_range("invalid").is_err());
         assert!(parse_date_range("2026-13-01").is_err());
         assert!(parse_date_range("+3x").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_health_check_endpoint() {
+        let data = Arc::new(RwLock::new(create_test_data()));
+        let app = create_router(data, None);
+
+        let req = Request::builder()
+            .uri("/api/health")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = ServiceExt::<Request<Body>>::oneshot(app, req)
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), HttpStatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body_str.contains("\"status\":\"ok\""));
+        assert!(body_str.contains("timestamp"));
+    }
+
+    #[tokio::test]
+    async fn test_get_today_endpoint() {
+        let data = Arc::new(RwLock::new(create_test_data()));
+        let app = create_router(data, None);
+
+        let req = Request::builder()
+            .uri("/api/get_today")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = ServiceExt::<Request<Body>>::oneshot(app, req)
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), HttpStatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body_str).unwrap();
+
+        assert!(json.get("events").is_some());
+        assert!(json.get("todos").is_some());
+        assert!(json.get("last_sync").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_get_today_calendars_endpoint() {
+        let data = Arc::new(RwLock::new(create_test_data()));
+        let app = create_router(data, None);
+
+        let req = Request::builder()
+            .uri("/api/get_today_calendars")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = ServiceExt::<Request<Body>>::oneshot(app, req)
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), HttpStatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body_str).unwrap();
+
+        assert!(json.get("events").is_some());
+        assert!(json.get("last_sync").is_some());
+        assert!(json.get("todos").is_none()); // Should not have todos
+    }
+
+    #[tokio::test]
+    async fn test_get_today_todos_endpoint() {
+        let data = Arc::new(RwLock::new(create_test_data()));
+        let app = create_router(data, None);
+
+        let req = Request::builder()
+            .uri("/api/get_today_todos")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = ServiceExt::<Request<Body>>::oneshot(app, req)
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), HttpStatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body_str).unwrap();
+
+        assert!(json.get("todos").is_some());
+        assert!(json.get("last_sync").is_some());
+        assert!(json.get("events").is_none()); // Should not have events
+    }
+
+    #[tokio::test]
+    async fn test_get_date_range_endpoint_today() {
+        let data = Arc::new(RwLock::new(create_test_data()));
+        let app = create_router(data, None);
+
+        let req = Request::builder()
+            .uri("/api/get_date_range/today")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = ServiceExt::<Request<Body>>::oneshot(app, req)
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), HttpStatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body_str).unwrap();
+
+        assert!(json.get("events").is_some());
+        assert!(json.get("todos").is_some());
+        assert!(json.get("last_sync").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_get_date_range_endpoint_week() {
+        let data = Arc::new(RwLock::new(create_test_data()));
+        let app = create_router(data, None);
+
+        let req = Request::builder()
+            .uri("/api/get_date_range/week")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = ServiceExt::<Request<Body>>::oneshot(app, req)
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), HttpStatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_get_date_range_endpoint_invalid() {
+        let data = Arc::new(RwLock::new(create_test_data()));
+        let app = create_router(data, None);
+
+        let req = Request::builder()
+            .uri("/api/get_date_range/invalid-range")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = ServiceExt::<Request<Body>>::oneshot(app, req)
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), HttpStatusCode::BAD_REQUEST);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body_str).unwrap();
+
+        assert!(json.get("error").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_debug_events_endpoint() {
+        let data = Arc::new(RwLock::new(create_test_data()));
+        let app = create_router(data, None);
+
+        let req = Request::builder()
+            .uri("/api/debug/events")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = ServiceExt::<Request<Body>>::oneshot(app, req)
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), HttpStatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body_str).unwrap();
+
+        assert!(json.get("current_time_utc").is_some());
+        assert!(json.get("current_time_local").is_some());
+        assert!(json.get("local_timezone_offset").is_some());
+        assert!(json.get("total_events").is_some());
+        assert!(json.get("total_todos").is_some());
+        assert!(json.get("events").is_some());
+        assert!(json.get("todos").is_some());
+        assert!(json.get("last_sync").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_trigger_sync_without_sync_manager() {
+        let data = Arc::new(RwLock::new(create_test_data()));
+        let app = create_router(data, None);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/sync")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = ServiceExt::<Request<Body>>::oneshot(app, req)
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), HttpStatusCode::SERVICE_UNAVAILABLE);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body_str).unwrap();
+
+        assert!(json.get("error").is_some());
+        let error_msg = json.get("error").unwrap().as_str().unwrap();
+        assert!(error_msg.contains("not available"));
+    }
+
+    #[test]
+    fn test_api_error_into_response() {
+        let error = ApiError::InvalidDateRange("test error".to_string());
+        let response = error.into_response();
+        assert_eq!(response.status(), HttpStatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_create_router() {
+        let data = Arc::new(RwLock::new(create_test_data()));
+        let router = create_router(data, None);
+        // Just verify the router is created without panicking
+        assert!(std::mem::size_of_val(&router) > 0);
+    }
+
+    #[test]
+    fn test_parse_date_range_with_invalid_colon_format() {
+        // Test with too many colons
+        let result = parse_date_range("2026-01-05:2026-01-10:extra");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_get_date_range_endpoint_specific_date() {
+        let data = Arc::new(RwLock::new(create_test_data()));
+        let app = create_router(data, None);
+
+        let req = Request::builder()
+            .uri("/api/get_date_range/2026-01-05")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = ServiceExt::<Request<Body>>::oneshot(app, req)
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), HttpStatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_get_date_range_endpoint_date_range() {
+        let data = Arc::new(RwLock::new(create_test_data()));
+        let app = create_router(data, None);
+
+        let req = Request::builder()
+            .uri("/api/get_date_range/2026-01-05:2026-01-10")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = ServiceExt::<Request<Body>>::oneshot(app, req)
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), HttpStatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_get_date_range_endpoint_relative_positive() {
+        let data = Arc::new(RwLock::new(create_test_data()));
+        let app = create_router(data, None);
+
+        let req = Request::builder()
+            .uri("/api/get_date_range/+3d")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = ServiceExt::<Request<Body>>::oneshot(app, req)
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), HttpStatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_get_date_range_endpoint_relative_negative() {
+        let data = Arc::new(RwLock::new(create_test_data()));
+        let app = create_router(data, None);
+
+        let req = Request::builder()
+            .uri("/api/get_date_range/-2d")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = ServiceExt::<Request<Body>>::oneshot(app, req)
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), HttpStatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_get_date_range_endpoint_tomorrow() {
+        let data = Arc::new(RwLock::new(create_test_data()));
+        let app = create_router(data, None);
+
+        let req = Request::builder()
+            .uri("/api/get_date_range/tomorrow")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = ServiceExt::<Request<Body>>::oneshot(app, req)
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), HttpStatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_get_date_range_endpoint_month() {
+        let data = Arc::new(RwLock::new(create_test_data()));
+        let app = create_router(data, None);
+
+        let req = Request::builder()
+            .uri("/api/get_date_range/month")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = ServiceExt::<Request<Body>>::oneshot(app, req)
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), HttpStatusCode::OK);
     }
 
     // Note: Full endpoint testing is done in integration tests
