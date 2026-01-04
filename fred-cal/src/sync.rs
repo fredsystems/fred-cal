@@ -105,6 +105,9 @@ impl SyncManager {
             info!("Server does not support WebDAV sync - using full sync");
         }
 
+        // Track calendar URLs we see during this sync
+        let mut active_calendar_urls = std::collections::HashSet::new();
+
         // Process each calendar
         for calendar in &calendars {
             let calendar_name = calendar
@@ -112,6 +115,9 @@ impl SyncManager {
                 .clone()
                 .unwrap_or_else(|| "Unnamed".to_string());
             let calendar_url = calendar.href.clone();
+
+            // Track this calendar as active
+            active_calendar_urls.insert(calendar_url.clone());
 
             // Store calendar color if available
             if let Some(color) = &calendar.color {
@@ -174,6 +180,41 @@ impl SyncManager {
                     calendar_name, calendar_url, e
                 );
             }
+        }
+
+        // Clean up events/todos from calendars that no longer exist
+        let (removed_events, removed_todos) = {
+            let mut data = self.data.write().await;
+
+            let initial_events = data.events.len();
+            let initial_todos = data.todos.len();
+
+            // Remove events from calendars not in the active list
+            data.events
+                .retain(|e| active_calendar_urls.contains(&e.calendar_url));
+
+            // Remove todos from calendars not in the active list
+            data.todos
+                .retain(|t| active_calendar_urls.contains(&t.calendar_url));
+
+            // Remove sync tokens from calendars not in the active list
+            data.sync_tokens
+                .retain(|url, _| active_calendar_urls.contains(url));
+
+            let removed = (
+                initial_events - data.events.len(),
+                initial_todos - data.todos.len(),
+            );
+
+            drop(data);
+            removed
+        };
+
+        if removed_events > 0 || removed_todos > 0 {
+            info!(
+                "Cleaned up {} events and {} todos from deleted calendars",
+                removed_events, removed_todos
+            );
         }
 
         // Update last sync time and save cache
@@ -444,6 +485,9 @@ impl SyncManager {
             data.sync_tokens.get(calendar_url).cloned()
         };
 
+        // Convert empty string to None (empty string is just a marker that calendar has been synced)
+        let sync_token = sync_token.and_then(|t| if t.is_empty() { None } else { Some(t) });
+
         debug!(
             "Incremental sync for {} with token: {:?}",
             calendar_name,
@@ -542,6 +586,7 @@ impl SyncManager {
 
         // Mark this calendar as synced by adding an empty token
         // This signals that next sync should try sync_collection
+        // The empty string will be converted to None in sync_calendar_incremental
         if self.client.supports_webdav_sync().await.unwrap_or(false) {
             data.sync_tokens
                 .entry(calendar_url.to_string())
@@ -1329,6 +1374,279 @@ mod tests {
         assert_eq!(parsed.day(), 4);
         assert_eq!(parsed.hour(), 22);
         assert_eq!(parsed.minute(), 0);
+    }
+
+    #[test]
+    fn test_parse_datetime_with_invalid_timezone() {
+        let naive =
+            NaiveDateTime::parse_from_str("2026-07-04 18:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
+        let cal_dt = CalendarDateTime::WithTimezone {
+            date_time: naive,
+            tzid: "Invalid/Timezone".to_string(),
+        };
+        let dpt = DatePerhapsTime::DateTime(cal_dt);
+
+        let result = parse_datetime(Some(&dpt));
+        assert!(result.is_some());
+
+        // Should fall back to treating as UTC
+        let parsed = result.unwrap();
+        assert_eq!(parsed.hour(), 18);
+    }
+
+    #[test]
+    fn test_parse_datetime_with_gmt_offset_timezone() {
+        let naive =
+            NaiveDateTime::parse_from_str("2026-07-04 18:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
+        let cal_dt = CalendarDateTime::WithTimezone {
+            date_time: naive,
+            tzid: "GMT-0700".to_string(),
+        };
+        let dpt = DatePerhapsTime::DateTime(cal_dt);
+
+        let result = parse_datetime(Some(&dpt));
+        assert!(result.is_some());
+
+        let parsed = result.unwrap();
+        // 18:00 GMT-0700 is 01:00 UTC next day
+        assert_eq!(parsed.year(), 2026);
+        assert_eq!(parsed.month(), 7);
+        assert_eq!(parsed.day(), 5);
+        assert_eq!(parsed.hour(), 1);
+    }
+
+    #[test]
+    fn test_parse_event_with_calendar_color() {
+        use icalendar::Event;
+
+        let event = Event::new()
+            .uid("event-color")
+            .summary("Colored Event")
+            .starts(Utc.with_ymd_and_hms(2026, 3, 15, 10, 0, 0).unwrap())
+            .ends(Utc.with_ymd_and_hms(2026, 3, 15, 11, 0, 0).unwrap())
+            .done();
+
+        let result = parse_event(&event, "Calendar", "/cal", Some("#FF5733"), None);
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        assert_eq!(parsed.calendar_color, Some("#FF5733".to_string()));
+    }
+
+    #[test]
+    fn test_parse_event_with_rrule() {
+        use icalendar::Event;
+
+        let event = Event::new()
+            .uid("recurring-event")
+            .summary("Weekly Meeting")
+            .starts(Utc.with_ymd_and_hms(2026, 3, 15, 10, 0, 0).unwrap())
+            .ends(Utc.with_ymd_and_hms(2026, 3, 15, 11, 0, 0).unwrap())
+            .add_property("RRULE", "FREQ=WEEKLY;BYDAY=MO")
+            .done();
+
+        let result = parse_event(&event, "Calendar", "/cal", None, None);
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        assert_eq!(parsed.rrule, Some("FREQ=WEEKLY;BYDAY=MO".to_string()));
+    }
+
+    #[test]
+    fn test_parse_event_with_status() {
+        use icalendar::Event;
+
+        let event = Event::new()
+            .uid("confirmed-event")
+            .summary("Confirmed Meeting")
+            .starts(Utc.with_ymd_and_hms(2026, 3, 15, 10, 0, 0).unwrap())
+            .ends(Utc.with_ymd_and_hms(2026, 3, 15, 11, 0, 0).unwrap())
+            .status(icalendar::EventStatus::Confirmed)
+            .done();
+
+        let result = parse_event(&event, "Calendar", "/cal", None, None);
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        assert_eq!(parsed.status, Some("Confirmed".to_string()));
+    }
+
+    #[test]
+    fn test_parse_event_without_end_time() {
+        use icalendar::Event;
+
+        let event = Event::new()
+            .uid("no-end-event")
+            .summary("Event without end")
+            .starts(Utc.with_ymd_and_hms(2026, 3, 15, 10, 0, 0).unwrap())
+            .done();
+
+        let result = parse_event(&event, "Calendar", "/cal", None, None);
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        // Should default to 1 hour after start
+        assert_eq!(
+            parsed.start,
+            Utc.with_ymd_and_hms(2026, 3, 15, 10, 0, 0).unwrap()
+        );
+        assert_eq!(
+            parsed.end,
+            Utc.with_ymd_and_hms(2026, 3, 15, 11, 0, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_parse_todo_with_status_completed() {
+        use icalendar::Todo as IcalTodo;
+
+        let todo = IcalTodo::new()
+            .uid("completed-todo")
+            .summary("Done Task")
+            .status(icalendar::TodoStatus::Completed)
+            .done();
+
+        let result = parse_todo(&todo, "Tasks", "/tasks", None);
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        assert_eq!(parsed.status, "Completed");
+    }
+
+    #[test]
+    fn test_parse_todo_with_status_in_process() {
+        use icalendar::Todo as IcalTodo;
+
+        let todo = IcalTodo::new()
+            .uid("in-progress-todo")
+            .summary("Working Task")
+            .status(icalendar::TodoStatus::InProcess)
+            .done();
+
+        let result = parse_todo(&todo, "Tasks", "/tasks", None);
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        assert_eq!(parsed.status, "InProcess");
+    }
+
+    #[test]
+    fn test_parse_todo_with_start_date() {
+        use icalendar::Todo as IcalTodo;
+
+        let start_time = Utc.with_ymd_and_hms(2026, 3, 1, 9, 0, 0).unwrap();
+        let todo = IcalTodo::new()
+            .uid("scheduled-todo")
+            .summary("Scheduled Task")
+            .starts(start_time)
+            .done();
+
+        let result = parse_todo(&todo, "Tasks", "/tasks", None);
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        assert_eq!(parsed.start, Some(start_time));
+    }
+
+    #[test]
+    fn test_parse_gmt_offset_edge_cases() {
+        // Test GMT with positive offset at boundary
+        let offset = parse_gmt_offset("GMT+1400");
+        assert!(offset.is_some());
+        assert_eq!(offset.unwrap().local_minus_utc(), 14 * 3600);
+
+        // Test GMT with negative offset at boundary
+        let offset = parse_gmt_offset("GMT-1200");
+        assert!(offset.is_some());
+        assert_eq!(offset.unwrap().local_minus_utc(), -12 * 3600);
+
+        // Test invalid - not enough digits
+        let offset = parse_gmt_offset("GMT+05");
+        assert!(offset.is_none());
+
+        // Test invalid - too many digits
+        let offset = parse_gmt_offset("GMT+05300");
+        assert!(offset.is_none());
+
+        // Test invalid - no GMT prefix
+        let offset = parse_gmt_offset("+0530");
+        assert!(offset.is_none());
+    }
+
+    #[test]
+    fn test_parse_event_with_multiple_properties() {
+        use icalendar::Event;
+
+        let event = Event::new()
+            .uid("complex-event")
+            .summary("Complex Event")
+            .description("Detailed description")
+            .location("Conference Room")
+            .starts(Utc.with_ymd_and_hms(2026, 5, 1, 14, 0, 0).unwrap())
+            .ends(Utc.with_ymd_and_hms(2026, 5, 1, 16, 0, 0).unwrap())
+            .status(icalendar::EventStatus::Confirmed)
+            .add_property("RRULE", "FREQ=MONTHLY")
+            .done();
+
+        let result = parse_event(
+            &event,
+            "Work Calendar",
+            "/calendars/work/",
+            Some("#0000FF"),
+            Some("etag-xyz"),
+        );
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        assert_eq!(parsed.uid, "complex-event");
+        assert_eq!(parsed.summary, "Complex Event");
+        assert_eq!(parsed.description, Some("Detailed description".to_string()));
+        assert_eq!(parsed.location, Some("Conference Room".to_string()));
+        assert_eq!(parsed.calendar_name, "Work Calendar");
+        assert_eq!(parsed.calendar_url, "/calendars/work/");
+        assert_eq!(parsed.calendar_color, Some("#0000FF".to_string()));
+        assert_eq!(parsed.rrule, Some("FREQ=MONTHLY".to_string()));
+        assert_eq!(parsed.status, Some("Confirmed".to_string()));
+        assert_eq!(parsed.etag, Some("etag-xyz".to_string()));
+        assert!(!parsed.all_day);
+    }
+
+    #[test]
+    fn test_parse_todo_with_all_fields() {
+        use icalendar::Todo as IcalTodo;
+
+        let start_time = Utc.with_ymd_and_hms(2026, 4, 1, 9, 0, 0).unwrap();
+        let due_time = Utc.with_ymd_and_hms(2026, 4, 5, 17, 0, 0).unwrap();
+        let completed_time = Utc.with_ymd_and_hms(2026, 4, 4, 15, 30, 0).unwrap();
+
+        let todo = IcalTodo::new()
+            .uid("full-todo")
+            .summary("Complete Task")
+            .description("Task with all fields")
+            .starts(start_time)
+            .due(due_time)
+            .completed(completed_time)
+            .priority(3)
+            .percent_complete(100)
+            .status(icalendar::TodoStatus::Completed)
+            .done();
+
+        let result = parse_todo(&todo, "My Tasks", "/calendars/tasks/", Some("etag-abc"));
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        assert_eq!(parsed.uid, "full-todo");
+        assert_eq!(parsed.summary, "Complete Task");
+        assert_eq!(parsed.description, Some("Task with all fields".to_string()));
+        assert_eq!(parsed.start, Some(start_time));
+        assert_eq!(parsed.due, Some(due_time));
+        assert_eq!(parsed.completed, Some(completed_time));
+        assert_eq!(parsed.priority, Some(3));
+        assert_eq!(parsed.percent_complete, Some(100));
+        assert_eq!(parsed.status, "Completed");
+        assert_eq!(parsed.calendar_name, "My Tasks");
+        assert_eq!(parsed.calendar_url, "/calendars/tasks/");
+        assert_eq!(parsed.etag, Some("etag-abc".to_string()));
     }
 
     // Full integration tests for sync manager are in the integration test suite
