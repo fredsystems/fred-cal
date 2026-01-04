@@ -6,15 +6,27 @@
 use anyhow::Result;
 use fast_dav_rs::CalDavClient;
 use std::io::Write;
+use std::sync::Once;
 use tempfile::NamedTempFile;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
     matchers::{method, path},
 };
 
+static INIT: Once = Once::new();
+
+/// Initialize rustls crypto provider (needed for tests)
+fn init_crypto() {
+    INIT.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 /// Test that we can connect to a mock CalDAV server with file-based credentials
 #[tokio::test]
 async fn test_caldav_connection_with_file_credentials() -> Result<()> {
+    init_crypto();
+
     // Start a mock CalDAV server
     let mock_server = MockServer::start().await;
 
@@ -75,6 +87,8 @@ async fn test_caldav_connection_with_file_credentials() -> Result<()> {
 /// Test that we can connect to a mock CalDAV server with direct credentials
 #[tokio::test]
 async fn test_caldav_connection_with_direct_credentials() -> Result<()> {
+    init_crypto();
+
     // Start a mock CalDAV server
     let mock_server = MockServer::start().await;
 
@@ -119,6 +133,8 @@ async fn test_caldav_connection_with_direct_credentials() -> Result<()> {
 /// Test that we can discover calendar home set from a mock server
 #[tokio::test]
 async fn test_calendar_home_set_discovery() -> Result<()> {
+    init_crypto();
+
     let mock_server = MockServer::start().await;
 
     // Mock the calendar-home-set discovery
@@ -162,6 +178,8 @@ async fn test_calendar_home_set_discovery() -> Result<()> {
 /// Test that we can list calendars from a mock server
 #[tokio::test]
 async fn test_list_calendars() -> Result<()> {
+    init_crypto();
+
     let mock_server = MockServer::start().await;
 
     // Mock the calendar list
@@ -222,6 +240,8 @@ async fn test_list_calendars() -> Result<()> {
 /// Test that authentication failures are properly handled
 #[tokio::test]
 async fn test_authentication_failure() -> Result<()> {
+    init_crypto();
+
     let mock_server = MockServer::start().await;
 
     // Mock an authentication failure
@@ -253,6 +273,8 @@ async fn test_authentication_failure() -> Result<()> {
 /// - The sync completes without errors even with empty results
 #[tokio::test]
 async fn test_parse_icalendar_data() -> Result<()> {
+    init_crypto();
+
     // Skip this test inside Nix builds
     if std::env::var_os("NIX_BUILD_TOP").is_some() {
         return Ok(());
@@ -356,7 +378,13 @@ async fn test_parse_icalendar_data() -> Result<()> {
     )?;
 
     // Create sync manager and perform sync
-    let sync_manager = Arc::new(SyncManager::new(client, cache)?);
+    let sync_manager = Arc::new(SyncManager::new(
+        client,
+        cache,
+        mock_server.uri(),
+        "testuser@example.com".to_string(),
+        "password123".to_string(),
+    )?);
     sync_manager.sync().await?;
 
     // Verify the parsed data

@@ -49,6 +49,13 @@ export CALDAV_PASSWORD="your-password"
   --username "user@example.com" \
   --password "your-password" \
   --port 8080
+
+# Diagnose calendar color support (check what the server returns)
+./target/release/fred-cal \
+  --caldav-server "https://caldav.example.com" \
+  --username "user@example.com" \
+  --password "your-password" \
+  --diagnose-colors
 ```
 
 The server will:
@@ -57,6 +64,28 @@ The server will:
 2. Cache the data locally in `~/.local/share/fred-cal/`
 3. Start the API server on `http://0.0.0.0:3000`
 4. Sync with CalDAV server every 15 minutes in the background
+
+### Calendar Color Diagnostics
+
+If your calendar colors are not showing up in the API, you can run the diagnostic mode to see what the server is returning:
+
+```bash
+./target/release/fred-cal \
+  --caldav-server "https://caldav.example.com" \
+  --username "user@example.com" \
+  --password "your-password" \
+  --diagnose-colors
+```
+
+This will:
+
+- Connect to your CalDAV server
+- Discover all calendars
+- Make custom PROPFIND requests checking both standard CalDAV and Apple-specific namespaces
+- Display the raw XML responses and parsed color values
+- Exit without starting the server
+
+**Note:** Calendar colors are supported but depend on the CalDAV server providing them. The standard CalDAV namespace is `urn:ietf:params:xml:ns:caldav` with the `calendar-color` property. Apple servers may use a different namespace: `http://apple.com/ns/ical/`. Use the diagnostic mode to see which namespace your server uses.
 
 ## API Endpoints
 
@@ -151,6 +180,7 @@ curl http://localhost:3000/api/get_date_range/+3d
   "end": "2026-01-05T11:00:00Z",
   "calendar_name": "Personal",
   "calendar_url": "/calendars/user/personal/",
+  "calendar_color": "#FF5733",
   "all_day": false,
   "rrule": "FREQ=WEEKLY;BYDAY=MO",
   "status": "CONFIRMED",
@@ -184,6 +214,8 @@ curl http://localhost:3000/api/get_date_range/+3d
 - `--caldav-server <URL>` - CalDAV server URL (or path to file containing URL)
 - `--username <USERNAME>` - Username for authentication (or path to file)
 - `--password <PASSWORD>` - Password for authentication (or path to file)
+- `--port <PORT>` - API server port (default: 3000)
+- `--diagnose-colors` - Run calendar color diagnostics and exit
 
 ### Environment Variables
 
@@ -308,9 +340,11 @@ Contributions are welcome! Please ensure:
 - [x] Background sync
 - [x] REST API for calendar events and todos
 - [x] Comprehensive testing
-- [ ] Full iCalendar parsing (VEVENT, VTODO)
+- [x] Full iCalendar parsing (VEVENT, VTODO)
+- [x] Recurring event expansion
+- [x] Calendar color support
+- [ ] Full EXDATE/RDATE/RECURRENCE-ID support
 - [ ] Write-back support (modify calendars/todos)
-- [ ] Recurring event expansion
 - [ ] WebSocket support for real-time updates
 - [ ] Multi-calendar filtering
 - [ ] Search functionality

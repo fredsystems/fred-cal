@@ -13,6 +13,8 @@ use fast_dav_rs::CalDavClient;
 use icalendar::{
     Calendar, CalendarDateTime, Component, DatePerhapsTime, Event, EventLike, Todo as IcalTodo,
 };
+use quick_xml::Reader;
+use quick_xml::events::Event as XmlEvent;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::{Duration, interval};
@@ -23,6 +25,9 @@ pub struct SyncManager {
     cache: Arc<CacheManager>,
     data: Arc<RwLock<CalendarData>>,
     calendar_colors: Arc<RwLock<std::collections::HashMap<String, String>>>,
+    server_url: String,
+    username: String,
+    password: String,
 }
 
 impl SyncManager {
@@ -31,7 +36,13 @@ impl SyncManager {
     /// # Errors
     ///
     /// Returns an error if the cache cannot be loaded from disk.
-    pub fn new(client: CalDavClient, cache: CacheManager) -> Result<Self> {
+    pub fn new(
+        client: CalDavClient,
+        cache: CacheManager,
+        server_url: String,
+        username: String,
+        password: String,
+    ) -> Result<Self> {
         let data = cache.load()?.map_or_else(
             || {
                 info!("No cache found, starting fresh");
@@ -48,6 +59,9 @@ impl SyncManager {
             cache: Arc::new(cache),
             data,
             calendar_colors: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            server_url,
+            username,
+            password,
         })
     }
 
@@ -107,10 +121,18 @@ impl SyncManager {
                     .insert(calendar_url.clone(), color.clone());
                 debug!("Calendar '{}' has color: {}", calendar_name, color);
             } else {
-                debug!(
-                    "Calendar '{}' has no color (not provided by server)",
-                    calendar_name
-                );
+                // Try fetching color from Apple namespace if standard namespace didn't provide it
+                if let Ok(Some(apple_color)) = self.fetch_apple_calendar_color(&calendar_url).await
+                {
+                    self.calendar_colors
+                        .write()
+                        .await
+                        .insert(calendar_url.clone(), apple_color.clone());
+                    debug!(
+                        "Calendar '{}' has Apple calendar-color: {}",
+                        calendar_name, apple_color
+                    );
+                }
             }
 
             debug!("Syncing calendar: {}", calendar_name);
@@ -175,6 +197,234 @@ impl SyncManager {
             calendars.len()
         );
 
+        Ok(())
+    }
+
+    /// Fetch calendar color from Apple namespace (<http://apple.com/ns/ical/>)
+    ///
+    /// This is a fallback for servers (like iCloud) that provide calendar-color
+    /// in Apple's proprietary namespace instead of the standard `CalDAV` namespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the PROPFIND request fails
+    async fn fetch_apple_calendar_color(&self, calendar_url: &str) -> Result<Option<String>> {
+        // Construct absolute URL from the relative calendar path
+        let absolute_url =
+            if calendar_url.starts_with("http://") || calendar_url.starts_with("https://") {
+                calendar_url.to_string()
+            } else {
+                let base = self.server_url.trim_end_matches('/');
+                let path = calendar_url.trim_start_matches('/');
+                format!("{base}/{path}")
+            };
+
+        let propfind_body = r#"<?xml version="1.0" encoding="UTF-8"?>
+<d:propfind xmlns:d="DAV:" xmlns:apple="http://apple.com/ns/ical/">
+  <d:prop>
+    <apple:calendar-color/>
+  </d:prop>
+</d:propfind>"#;
+
+        let client = reqwest::Client::new();
+        let response = client
+            .request(reqwest::Method::from_bytes(b"PROPFIND")?, &absolute_url)
+            .header("Depth", "0")
+            .header("Content-Type", "application/xml; charset=utf-8")
+            .basic_auth(&self.username, Some(&self.password))
+            .body(propfind_body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            debug!(
+                "Apple color PROPFIND returned non-success status: {}",
+                response.status()
+            );
+            return Ok(None);
+        }
+
+        let body = response.text().await?;
+
+        // Parse the XML to extract Apple calendar-color
+        let mut reader = Reader::from_str(&body);
+        reader.config_mut().trim_text(true);
+
+        let mut buf = Vec::new();
+        let mut in_apple_color = false;
+        let mut color_value = None;
+
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(XmlEvent::Start(ref e)) => {
+                    let name = e.name();
+                    let local_name_bytes = name.local_name();
+                    let local_name = String::from_utf8_lossy(local_name_bytes.as_ref()).to_string();
+
+                    if local_name == "calendar-color" {
+                        // Check if it's in Apple namespace by looking at the xmlns attribute
+                        // iCloud returns: <calendar-color xmlns="http://apple.com/ns/ical/">
+                        for attr in e.attributes().flatten() {
+                            let key = std::str::from_utf8(attr.key.as_ref()).unwrap_or("");
+                            let value = std::str::from_utf8(&attr.value).unwrap_or("");
+                            if key == "xmlns" && value == "http://apple.com/ns/ical/" {
+                                in_apple_color = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                Ok(XmlEvent::Text(e)) => {
+                    if in_apple_color {
+                        color_value = Some(std::str::from_utf8(e.as_ref())?.to_string());
+                    }
+                }
+                Ok(XmlEvent::End(ref e)) => {
+                    let name = e.name();
+                    let local_name_bytes = name.local_name();
+                    let local_name = String::from_utf8_lossy(local_name_bytes.as_ref()).to_string();
+
+                    if local_name == "calendar-color" && in_apple_color {
+                        // We found the color, can break early
+                        break;
+                    }
+                }
+                Ok(XmlEvent::Eof) => break,
+                Err(e) => {
+                    debug!("Error parsing Apple color XML: {:?}", e);
+                    break;
+                }
+                _ => {}
+            }
+            buf.clear();
+        }
+
+        Ok(color_value)
+    }
+
+    /// Diagnostic function to check what calendar-color properties the server returns
+    ///
+    /// Makes a custom `PROPFIND` request with both standard `CalDAV` and Apple namespaces
+    /// to help debug calendar color issues.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the PROPFIND request fails
+    pub async fn diagnose_calendar_color(
+        &self,
+        calendar_url: &str,
+        base_url: &str,
+        username: &str,
+        password: &str,
+    ) -> Result<()> {
+        info!("=== Calendar Color Diagnostic for {} ===", calendar_url);
+
+        // Construct absolute URL from base and relative calendar path
+        let absolute_url =
+            if calendar_url.starts_with("http://") || calendar_url.starts_with("https://") {
+                calendar_url.to_string()
+            } else {
+                // Remove trailing slash from base_url and leading slash from calendar_url if present
+                let base = base_url.trim_end_matches('/');
+                let path = calendar_url.trim_start_matches('/');
+                format!("{base}/{path}")
+            };
+
+        info!("Absolute URL: {}", absolute_url);
+
+        // Build PROPFIND request body with both standard and Apple namespaces
+        let propfind_body = r#"<?xml version="1.0" encoding="UTF-8"?>
+<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:apple="http://apple.com/ns/ical/">
+  <d:prop>
+    <d:displayname/>
+    <c:calendar-color/>
+    <apple:calendar-color/>
+  </d:prop>
+</d:propfind>"#;
+
+        // Make the request
+        let client = reqwest::Client::new();
+        let response = client
+            .request(reqwest::Method::from_bytes(b"PROPFIND")?, &absolute_url)
+            .header("Depth", "0")
+            .header("Content-Type", "application/xml; charset=utf-8")
+            .basic_auth(username, Some(password))
+            .body(propfind_body)
+            .send()
+            .await?;
+
+        let status = response.status();
+        info!("Response status: {}", status);
+
+        let body = response.text().await?;
+        info!("Response body:\n{}", body);
+
+        // Parse the XML to extract color properties
+        let mut reader = Reader::from_str(&body);
+        reader.config_mut().trim_text(true);
+
+        let mut buf = Vec::new();
+        let mut in_caldav_color = false;
+        let mut in_apple_color = false;
+        let mut current_text = String::new();
+
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(XmlEvent::Start(ref e)) => {
+                    let name = e.name();
+                    let local_name_bytes = name.local_name();
+                    let local_name = String::from_utf8_lossy(local_name_bytes.as_ref()).to_string();
+
+                    if local_name == "calendar-color" {
+                        // Check namespace
+                        if let Some(ns) = name.prefix() {
+                            let ns_str = String::from_utf8_lossy(ns.as_ref()).to_string();
+                            if ns_str == "c" {
+                                in_caldav_color = true;
+                                info!("Found CalDAV calendar-color element");
+                            } else if ns_str == "apple" {
+                                in_apple_color = true;
+                                info!("Found Apple calendar-color element");
+                            }
+                        }
+                    }
+                }
+                Ok(XmlEvent::Text(e)) => {
+                    if in_caldav_color || in_apple_color {
+                        current_text = std::str::from_utf8(e.as_ref())?.to_string();
+                    }
+                }
+                Ok(XmlEvent::End(ref e)) => {
+                    let name = e.name();
+                    let local_name_bytes = name.local_name();
+                    let local_name = String::from_utf8_lossy(local_name_bytes.as_ref()).to_string();
+
+                    if local_name == "calendar-color" {
+                        if in_caldav_color {
+                            info!("CalDAV calendar-color value: '{}'", current_text);
+                            in_caldav_color = false;
+                        } else if in_apple_color {
+                            info!("Apple calendar-color value: '{}'", current_text);
+                            in_apple_color = false;
+                        }
+                        current_text.clear();
+                    }
+                }
+                Ok(XmlEvent::Eof) => break,
+                Err(e) => {
+                    warn!(
+                        "Error parsing XML at position {}: {:?}",
+                        reader.buffer_position(),
+                        e
+                    );
+                    break;
+                }
+                _ => {}
+            }
+            buf.clear();
+        }
+
+        info!("=== End Calendar Color Diagnostic ===");
         Ok(())
     }
 
