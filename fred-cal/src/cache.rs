@@ -187,6 +187,7 @@ mod tests {
             end: Utc.with_ymd_and_hms(2026, 1, 5, 11, 0, 0).single().unwrap(),
             calendar_name: "Test Calendar".to_string(),
             calendar_url: "/test".to_string(),
+            calendar_color: None,
             all_day: false,
             rrule: None,
             status: None,
