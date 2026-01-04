@@ -486,8 +486,9 @@ mod tests {
 
     #[test]
     fn test_new() -> Result<()> {
-        // Test the actual new() method that uses XDG directories
-        let cache = CacheManager::new()?;
+        // Test the new_with_path() method with a temporary directory
+        let temp_dir = tempdir()?;
+        let cache = CacheManager::new_with_path(temp_dir.path().to_path_buf())?;
 
         // Cache directory should exist
         assert!(cache.cache_directory().exists());
@@ -506,10 +507,12 @@ mod tests {
     }
 
     #[test]
-    fn test_default_implementation() {
-        // Test that default creates a working cache manager
-        let cache = CacheManager::default();
+    fn test_default_implementation() -> Result<()> {
+        // Test that new_with_path creates a working cache manager
+        let temp_dir = tempdir()?;
+        let cache = CacheManager::new_with_path(temp_dir.path().to_path_buf())?;
         assert!(cache.cache_directory().exists());
+        Ok(())
     }
 
     #[test]
