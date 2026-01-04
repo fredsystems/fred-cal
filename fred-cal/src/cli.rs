@@ -26,6 +26,10 @@ pub struct Cli {
     /// Port for the API server to listen on
     #[arg(long, env = "API_PORT", default_value = "3000")]
     pub port: u16,
+
+    /// Run calendar color diagnostics and exit (check what calendar-color properties the server returns)
+    #[arg(long)]
+    pub diagnose_colors: bool,
 }
 
 /// Credentials for `CalDAV` authentication
