@@ -33,6 +33,9 @@ pub struct CalendarEvent {
     /// Calendar URL/path
     pub calendar_url: String,
 
+    /// Calendar color (hex format, e.g., "#FF5733")
+    pub calendar_color: Option<String>,
+
     /// Whether this is an all-day event
     pub all_day: bool,
 
@@ -198,6 +201,7 @@ mod tests {
                 .expect("valid datetime"),
             calendar_name: "Test".to_string(),
             calendar_url: "/test".to_string(),
+            calendar_color: None,
             all_day: false,
             rrule: None,
             status: None,
@@ -219,6 +223,7 @@ mod tests {
                 .expect("valid datetime"),
             calendar_name: "Test".to_string(),
             calendar_url: "/test".to_string(),
+            calendar_color: None,
             all_day: false,
             rrule: None,
             status: None,
@@ -363,6 +368,7 @@ mod tests {
                 .expect("valid datetime"),
             calendar_name: "Test".to_string(),
             calendar_url: "/test".to_string(),
+            calendar_color: None,
             all_day: true,
             rrule: None,
             status: None,
@@ -409,6 +415,7 @@ mod tests {
                 .expect("valid datetime"),
             calendar_name: "Test".to_string(),
             calendar_url: "/test".to_string(),
+            calendar_color: None,
             all_day: true,
             rrule: None,
             status: None,
@@ -431,6 +438,7 @@ mod tests {
                 .expect("valid datetime"),
             calendar_name: "Test".to_string(),
             calendar_url: "/test".to_string(),
+            calendar_color: None,
             all_day: true,
             rrule: None,
             status: None,

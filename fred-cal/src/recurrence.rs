@@ -214,6 +214,7 @@ mod tests {
             end,
             calendar_name: "Test".to_string(),
             calendar_url: "/test".to_string(),
+            calendar_color: None,
             all_day: false,
             rrule,
             status: None,

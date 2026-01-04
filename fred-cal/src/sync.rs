@@ -22,6 +22,7 @@ pub struct SyncManager {
     client: Arc<CalDavClient>,
     cache: Arc<CacheManager>,
     data: Arc<RwLock<CalendarData>>,
+    calendar_colors: Arc<RwLock<std::collections::HashMap<String, String>>>,
 }
 
 impl SyncManager {
@@ -46,6 +47,7 @@ impl SyncManager {
             client: Arc::new(client),
             cache: Arc::new(cache),
             data,
+            calendar_colors: Arc::new(RwLock::new(std::collections::HashMap::new())),
         })
     }
 
@@ -96,6 +98,20 @@ impl SyncManager {
                 .clone()
                 .unwrap_or_else(|| "Unnamed".to_string());
             let calendar_url = calendar.href.clone();
+
+            // Store calendar color if available
+            if let Some(color) = &calendar.color {
+                self.calendar_colors
+                    .write()
+                    .await
+                    .insert(calendar_url.clone(), color.clone());
+                debug!("Calendar '{}' has color: {}", calendar_name, color);
+            } else {
+                debug!(
+                    "Calendar '{}' has no color (not provided by server)",
+                    calendar_name
+                );
+            }
 
             debug!("Syncing calendar: {}", calendar_name);
 
@@ -342,10 +358,17 @@ impl SyncManager {
 
                 // Process events
                 for event_comp in calendar.events() {
+                    // Get calendar color
+                    let calendar_color = {
+                        let colors = self.calendar_colors.read().await;
+                        colors.get(calendar_url).cloned()
+                    };
+
                     match parse_event(
                         event_comp,
                         calendar_name,
                         calendar_url,
+                        calendar_color.as_deref(),
                         etag.map(String::as_str),
                     ) {
                         Ok(event) => {
@@ -440,10 +463,17 @@ impl SyncManager {
                         match ical_data.parse::<Calendar>() {
                             Ok(calendar) => {
                                 for event_comp in calendar.events() {
+                                    // Get calendar color
+                                    let calendar_color = {
+                                        let colors = self.calendar_colors.read().await;
+                                        colors.get(calendar_url).cloned()
+                                    };
+
                                     match parse_event(
                                         event_comp,
                                         calendar_name,
                                         calendar_url,
+                                        calendar_color.as_deref(),
                                         etag.as_deref(),
                                     ) {
                                         Ok(event) => {
@@ -523,6 +553,7 @@ fn parse_event(
     event: &Event,
     calendar_name: &str,
     calendar_url: &str,
+    calendar_color: Option<&str>,
     etag: Option<&str>,
 ) -> Result<CalendarEvent> {
     // UID is required
@@ -571,6 +602,7 @@ fn parse_event(
         end,
         calendar_name: calendar_name.to_string(),
         calendar_url: calendar_url.to_string(),
+        calendar_color: calendar_color.map(String::from),
         all_day,
         rrule,
         status,
@@ -824,7 +856,7 @@ mod tests {
             .ends(Utc.with_ymd_and_hms(2026, 3, 15, 11, 0, 0).unwrap())
             .done();
 
-        let result = parse_event(&event, "Test Calendar", "/calendar/test", None);
+        let result = parse_event(&event, "Test Calendar", "/calendar/test", None, None);
         assert!(result.is_ok());
 
         let parsed = result.unwrap();
@@ -849,7 +881,7 @@ mod tests {
             .ends(Utc.with_ymd_and_hms(2026, 4, 1, 10, 0, 0).unwrap())
             .done();
 
-        let result = parse_event(&event, "Calendar", "/cal", Some("etag-123"));
+        let result = parse_event(&event, "Calendar", "/cal", None, Some("etag-123"));
         assert!(result.is_ok());
 
         let parsed = result.unwrap();
@@ -867,7 +899,7 @@ mod tests {
             .all_day(date)
             .done();
 
-        let result = parse_event(&event, "Calendar", "/cal", None);
+        let result = parse_event(&event, "Calendar", "/cal", None, None);
         assert!(result.is_ok());
 
         let parsed = result.unwrap();
@@ -884,7 +916,7 @@ mod tests {
             .starts(Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap())
             .done();
 
-        let result = parse_event(&event, "Cal", "/c", None);
+        let result = parse_event(&event, "Cal", "/c", None, None);
         assert!(result.is_ok());
 
         let parsed = result.unwrap();
