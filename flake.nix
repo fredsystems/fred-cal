@@ -41,7 +41,7 @@
               lockFile = ./Cargo.lock;
 
               outputHashes = {
-                "fast-dav-rs-0.3.0" = "sha256-q7cNsn2L/i1ojMMaakUIudgSswd+zru9VT8azpjR/Jo=";
+                "fast-dav-rs-0.3.0" = "sha256-t1DjFkV5bT/UPDQOpU9vzQRXmqS1t60goPz+24+ugdg=";
               };
             };
 
