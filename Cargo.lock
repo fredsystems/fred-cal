@@ -593,7 +593,7 @@ dependencies = [
 [[package]]
 name = "fast-dav-rs"
 version = "0.3.0"
-source = "git+https://github.com/fredclausen/fast-dav-rs?branch=shell-fixes-and-nixos#97ce020e3765e0b802845139d87cc3a2c7be2436"
+source = "git+https://github.com/fredclausen/fast-dav-rs?branch=shell-fixes-and-nixos#51098331c9f17eb2ab46e5d1e1ff14977eae47d1"
 dependencies = [
  "anyhow",
  "async-compression",
