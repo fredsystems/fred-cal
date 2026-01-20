@@ -23,7 +23,7 @@ duct = "1.1.1"
 futures = "0.3.31"
 rrule = "0.14.0"
 rustls = { version = "0.23.35", features = ["ring"] }
-fast-dav-rs = { git = "https://github.com/fredclausen/fast-dav-rs", branch = "apple-specific-issues" }
+fast-dav-rs = { git = "https://github.com/fredclausen/fast-dav-rs", branch = "shell-fixes-and-nixos" }
 #fast-dav-rs = "0.2.0"
 icalendar = "0.17.6"
 serde = { version = "1.0.209", features = ["derive"] }
