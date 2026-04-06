@@ -33,16 +33,12 @@
         rec {
           fred-cal = pkgs.rustPlatform.buildRustPackage {
             pname = "fred-cal";
-            version = "0.1.0";
+            version = "0.1.1";
 
             src = ./.;
 
             cargoLock = {
               lockFile = ./Cargo.lock;
-
-              outputHashes = {
-                "fast-dav-rs-0.3.0" = "sha256-t1DjFkV5bT/UPDQOpU9vzQRXmqS1t60goPz+24+ugdg=";
-              };
             };
 
             nativeBuildInputs = [
