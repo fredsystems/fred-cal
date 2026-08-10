@@ -897,13 +897,9 @@ fn parse_todo(
     });
 
     // Percent complete (0-100)
-    let percent_complete = todo.get_percent_complete().and_then(|p| {
-        if (0..=100).contains(&p) {
-            Some(p)
-        } else {
-            None
-        }
-    });
+    let percent_complete = todo
+        .get_percent_complete()
+        .filter(|&p| (0..=100).contains(&p));
 
     // Status (default to NEEDS-ACTION if not specified)
     let status = todo
@@ -1007,10 +1003,9 @@ fn parse_gmt_offset(tzid: &str) -> Option<chrono::FixedOffset> {
         // Parse sign
         let (sign, rest) = if let Some(rest) = offset_str.strip_prefix('+') {
             (1, rest)
-        } else if let Some(rest) = offset_str.strip_prefix('-') {
-            (-1, rest)
         } else {
-            return None;
+            let rest = offset_str.strip_prefix('-')?;
+            (-1, rest)
         };
 
         // Parse HHMM
