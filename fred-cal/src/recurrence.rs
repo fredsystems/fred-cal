@@ -419,7 +419,7 @@ mod tests {
         }
 
         // Should have gotten some instances but not all 100
-        assert!(!instances.is_empty());
+        assert_ne!(instances, Vec::<CalendarEvent>::new());
         assert!(instances.len() < 100);
     }
 
@@ -691,7 +691,7 @@ mod tests {
 
         // Should get up to 6 instances
         assert!(instances.len() <= 6);
-        assert!(!instances.is_empty());
+        assert_ne!(instances, Vec::<CalendarEvent>::new());
     }
 
     #[test]
