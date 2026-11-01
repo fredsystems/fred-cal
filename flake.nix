@@ -107,7 +107,10 @@
                 cargo-deny
                 cargo-machete
                 typos
-                cargo-llvm-cov
+                # FIXME: drop once nixpkgs builds cargo-llvm-cov against the LLVM that
+                # rustc 1.99 emits profiles for; its test suite fails on the profraw
+                # version mismatch, but the tool works with the toolchain llvm-tools.
+                (cargo-llvm-cov.overrideAttrs { doCheck = false; })
               ]
               ++ (chk.passthru.devPackages or [ ])
               ++ chk.enabledPackages;
