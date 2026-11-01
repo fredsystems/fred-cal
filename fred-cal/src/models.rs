@@ -181,8 +181,8 @@ mod tests {
     #[test]
     fn test_calendar_data_new() {
         let data = CalendarData::new();
-        assert!(data.events.is_empty());
-        assert!(data.todos.is_empty());
+        assert_eq!(data.events, Vec::<CalendarEvent>::new());
+        assert_eq!(data.todos, Vec::<Todo>::new());
     }
 
     #[test]
@@ -619,8 +619,8 @@ mod tests {
     #[test]
     fn test_calendar_data_default() {
         let data = CalendarData::default();
-        assert!(data.events.is_empty());
-        assert!(data.todos.is_empty());
+        assert_eq!(data.events, Vec::<CalendarEvent>::new());
+        assert_eq!(data.todos, Vec::<Todo>::new());
         assert!(data.sync_tokens.is_empty());
     }
 
