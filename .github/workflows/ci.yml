@@ -29,6 +29,7 @@ jobs:
       # --- Enter your flake's devShell (same behavior as direnv) ---
       - name: Run checks in devShell
         env:
+          GITHUB_TOKEN: ${{ github.token }}
           # `no-commit-to-branch` exists to stop developers committing
           # directly to `main`. On a `push` to `main` the checked-out
           # branch IS `main`, so the hook fails by construction and says
