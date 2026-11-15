@@ -355,7 +355,7 @@ Built with:
 
 - [axum](https://github.com/tokio-rs/axum) - Web framework
 - [tokio](https://tokio.rs/) - Async runtime
-- [fast-dav-rs](https://github.com/mhatzl/fast-dav-rs) - CalDAV client
+- [fast-dav-rs](https://github.com/Goopil/fast-dav-rs) - CalDAV client
 - [chrono](https://github.com/chronotope/chrono) - Date/time handling
 - [serde](https://serde.rs/) - Serialization framework
 
